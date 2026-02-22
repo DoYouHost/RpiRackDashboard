@@ -3,8 +3,10 @@
 import os
 import time
 import threading
+from collections import deque
 from PIL import Image, ImageDraw, ImageFont
-from typing import Callable, Dict, List, Optional, Any, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Any, Tuple
+import numpy as np
 
 # ── Font loading ──────────────────────────────────────────────────────────────
 _FONT_DIR     = os.path.join(os.path.dirname(__file__), "fonts")
@@ -28,6 +30,32 @@ FONT_OVERVIEW_NODEID = _load(_MONO_BOLD,    24)   # 'N1'/'N2'/'N3'
 FONT_DETAIL_STAT     = _load(_MONO_BOLD,    28)   # secondary stats on detail page
 FONT_STAT_GRID       = _load(_MONO_BOLD,    22)   # 2-row grid stats on detail page
 
+# ── getbbox memoizer — font metric lookups are expensive; cache by (font, text) ─
+_BB: Dict[Any, Any] = {}
+
+def _bb(font: ImageFont.FreeTypeFont, text: str) -> tuple:
+    key = (id(font), text)
+    v = _BB.get(key)
+    if v is None:
+        v = font.getbbox(text)
+        _BB[key] = v
+    return v
+
+# Warm cache for all fixed layout strings known at import time
+for _s in (
+    "CPU", "RAM", "TMP", "%", "\u00b0C", "100", "99", "--",
+    "N1", "N2", "N3", "NODE 1", "NODE 2", "NODE 3",
+    "FREQ", "DISK", "UPTIME", "LOAD", "NET DN", "NET UP",
+    "overview", "detail",
+):
+    for _f in (
+        FONT_OVERVIEW_VALUE, FONT_OVERVIEW_UNIT, FONT_OVERVIEW_LABEL,
+        FONT_OVERVIEW_NODEID, FONT_HIST_LABEL, FONT_STAT_GRID,
+        FONT_BIG_VALUE, FONT_HEADER_STAT, FONT_NODE_LABEL,
+    ):
+        _bb(_f, _s)
+
+
 # ── Per-node accent palette ───────────────────────────────────────────────────
 NODE_COLORS: Dict[str, str] = {
     "node1": "#00FF88",
@@ -37,19 +65,17 @@ NODE_COLORS: Dict[str, str] = {
 _DEFAULT_COLOR = "#FFFFFF"
 
 # ── Internal histogram ring buffers ───────────────────────────────────────────
-_hist_cpu: Dict[str, List[float]] = {}
-_hist_ram: Dict[str, List[float]] = {}
+_hist_cpu: Dict[str, Deque[float]] = {}
+_hist_ram: Dict[str, Deque[float]] = {}
 _HIST_LEN = 320
 
 def _ensure_hist(node_id: str) -> None:
     if node_id not in _hist_cpu:
-        _hist_cpu[node_id] = [0.0] * _HIST_LEN
-        _hist_ram[node_id] = [0.0] * _HIST_LEN
+        _hist_cpu[node_id] = deque([0.0] * _HIST_LEN, maxlen=_HIST_LEN)
+        _hist_ram[node_id] = deque([0.0] * _HIST_LEN, maxlen=_HIST_LEN)
 
-def _push(buf: Dict[str, List[float]], node_id: str, value: Optional[float]) -> None:
+def _push(buf: Dict[str, Deque[float]], node_id: str, value: Optional[float]) -> None:
     buf[node_id].append(value if value is not None else 0.0)
-    if len(buf[node_id]) > _HIST_LEN:
-        buf[node_id].pop(0)
 
 def _health_color(value: float, low: float = 60, high: float = 85) -> str:
     if value < low:
@@ -240,7 +266,7 @@ def _build_switcher_image(
             )
 
         # Page name below thumbnail
-        bb      = FONT_HIST_LABEL.getbbox(name)
+        bb      = _bb(FONT_HIST_LABEL, name)
         lw      = bb[2] - bb[0]
         label_x = cx + (tw - lw) // 2
         label_y = ty + th + 3
@@ -309,13 +335,13 @@ def _draw_arc_gauge(
         draw.arc(bbox, start=200, end=200 + 140 * v, fill=color, width=thickness)
 
     # Label above cy
-    bb_l = lbl_font.getbbox(label)
+    bb_l = _bb(lbl_font, label)
     lx = cx - (bb_l[2] - bb_l[0]) // 2 - bb_l[0]
     ly = cy - (bb_l[3] - bb_l[1]) - 3
     draw.text((lx, ly), label, font=lbl_font, fill="#AAAAAA")
 
     # Value below cy, inside the U
-    bb_v = val_font.getbbox(val_str)
+    bb_v = _bb(val_font, val_str)
     vx = cx - (bb_v[2] - bb_v[0]) // 2 - bb_v[0]
     vy = cy + 4 - bb_v[1]
     draw.text((vx, vy), val_str, font=val_font, fill=color)
@@ -347,7 +373,7 @@ def _page_detail(draw: ImageDraw.ImageDraw, width: int, height: int,
     TITLE_H = 24
     draw.rectangle([20, 0, 299, TITLE_H - 1], fill=accent)
     title = f"NODE {node_num}"
-    bb_t  = FONT_OVERVIEW_NODEID.getbbox(title)
+    bb_t  = _bb(FONT_OVERVIEW_NODEID, title)
     tx    = 20 + (280 - (bb_t[2] - bb_t[0])) // 2 - bb_t[0]
     ty    = (TITLE_H - (bb_t[3] - bb_t[1])) // 2 - bb_t[1]
     draw.text((tx, ty), title, font=FONT_OVERVIEW_NODEID, fill="#000000")
@@ -369,16 +395,16 @@ def _page_detail(draw: ImageDraw.ImageDraw, width: int, height: int,
         zip(DT_COL_STARTS, DT_COL_LABELS, DT_COL_UNITS, raw_vals)
     ):
         # Column label
-        bb_lab = FONT_OVERVIEW_LABEL.getbbox(label)
+        bb_lab = _bb(FONT_OVERVIEW_LABEL, label)
         lab_w  = bb_lab[2] - bb_lab[0]
         lab_x  = col_x + (DT_COL_W - lab_w) // 2
         draw.text((lab_x, DT_LABEL_Y), label, font=FONT_OVERVIEW_LABEL, fill="#AAAAAA")
 
         # Value — right-aligned, max digits 3/3/2
         max_str   = "99" if col_idx == 2 else "100"
-        bb_max    = FONT_OVERVIEW_VALUE.getbbox(max_str)
+        bb_max    = _bb(FONT_OVERVIEW_VALUE, max_str)
         max_num_w = bb_max[2] - bb_max[0]
-        bb_unit   = FONT_OVERVIEW_UNIT.getbbox(unit)
+        bb_unit   = _bb(FONT_OVERVIEW_UNIT, unit)
         unit_w    = bb_unit[2] - bb_unit[0]
         col_right = col_x + DT_COL_W - 1
         unit_x    = col_right - unit_w
@@ -391,7 +417,7 @@ def _page_detail(draw: ImageDraw.ImageDraw, width: int, height: int,
             val_str   = "--"
             val_color = "#444444"
 
-        bb_num = FONT_OVERVIEW_VALUE.getbbox(val_str)
+        bb_num = _bb(FONT_OVERVIEW_VALUE, val_str)
         num_w  = bb_num[2] - bb_num[0]
         val_x  = val_right - max_num_w + (max_num_w - num_w)
 
@@ -473,11 +499,11 @@ def _page_detail(draw: ImageDraw.ImageDraw, width: int, height: int,
         ("NET DN", _fmt_net(net_rx_rate), "#00FF88", 172, 184),
         ("NET UP", _fmt_net(net_tx_rate), "#00CCFF", 206, 218),
     ):
-        bb_sl = FONT_OVERVIEW_LABEL.getbbox(label)
+        bb_sl = _bb(FONT_OVERVIEW_LABEL, label)
         sl_x  = NET_COL_X + (NET_COL_W - (bb_sl[2] - bb_sl[0])) // 2
         draw.text((sl_x, lbl_y), label, font=FONT_OVERVIEW_LABEL, fill="#AAAAAA")
 
-        bb_sv = FONT_STAT_GRID.getbbox(val_str)
+        bb_sv = _bb(FONT_STAT_GRID, val_str)
         sv_x  = NET_COL_X + (NET_COL_W - (bb_sv[2] - bb_sv[0])) // 2 - bb_sv[0]
         sv_y  = val_y - bb_sv[1]
         draw.text((sv_x, sv_y), val_str, font=FONT_STAT_GRID, fill=val_color)
@@ -505,11 +531,11 @@ def _page_detail(draw: ImageDraw.ImageDraw, width: int, height: int,
         ((20,  93), ("UPTIME", uptime_str, "#CCCCCC"), SSTAT_R2_LBL_Y, SSTAT_R2_VAL_Y),
         ((206, 94), ("LOAD",   load_str,   "#CCCCCC"), SSTAT_R2_LBL_Y, SSTAT_R2_VAL_Y),
     ):
-        bb_sl = FONT_OVERVIEW_LABEL.getbbox(label)
+        bb_sl = _bb(FONT_OVERVIEW_LABEL, label)
         sl_x  = col_x + (col_w - (bb_sl[2] - bb_sl[0])) // 2
         draw.text((sl_x, lbl_y), label, font=FONT_OVERVIEW_LABEL, fill="#AAAAAA")
 
-        bb_sv = FONT_STAT_GRID.getbbox(val_str)
+        bb_sv = _bb(FONT_STAT_GRID, val_str)
         sv_x  = col_x + (col_w - (bb_sv[2] - bb_sv[0])) // 2 - bb_sv[0]
         sv_y  = val_y - bb_sv[1]
         draw.text((sv_x, sv_y), val_str, font=FONT_STAT_GRID, fill=val_color)
@@ -548,7 +574,7 @@ def draw_node_section_overview(
 
     # Node ID zone: filled accent rectangle, black text centered in the rectangle
     node_label = f"N{node_num}"
-    bb_nid  = FONT_OVERVIEW_NODEID.getbbox(node_label)
+    bb_nid  = _bb(FONT_OVERVIEW_NODEID, node_label)
     nid_w   = bb_nid[2] - bb_nid[0]
     nid_h   = bb_nid[3] - bb_nid[1]
     rect_w  = _OV_NODEID_X0 + _OV_NODEID_ZONE - _OV_LEFT_BAR_X0   # = 65 - 20 = 46px
@@ -563,7 +589,7 @@ def draw_node_section_overview(
         zip(_OV_COL_STARTS, _OV_COL_LABELS, _OV_COL_UNITS, raw_vals)
     ):
         # Small label at top of column
-        bb_lab = FONT_OVERVIEW_LABEL.getbbox(label)
+        bb_lab = _bb(FONT_OVERVIEW_LABEL, label)
         lab_w  = bb_lab[2] - bb_lab[0]
         lab_x  = col_x + (_OV_COL_W - lab_w) // 2
         draw.text(
@@ -576,9 +602,9 @@ def draw_node_section_overview(
         # Big value — right-aligned with reserved digit space
         # Max strings: "100" for CPU/RAM (3 digits), "99" for TMP (2 digits)
         max_str   = "99" if col_idx == 2 else "100"
-        bb_max    = FONT_OVERVIEW_VALUE.getbbox(max_str)
+        bb_max    = _bb(FONT_OVERVIEW_VALUE, max_str)
         max_num_w = bb_max[2] - bb_max[0]
-        bb_unit   = FONT_OVERVIEW_UNIT.getbbox(unit)
+        bb_unit   = _bb(FONT_OVERVIEW_UNIT, unit)
         unit_w    = bb_unit[2] - bb_unit[0]
         # Right edge of the unit lands at col right edge; value sits left of unit
         col_right = col_x + _OV_COL_W - 1
@@ -592,7 +618,7 @@ def draw_node_section_overview(
             val_str   = "--"
             val_color = "#444444"
 
-        bb_num = FONT_OVERVIEW_VALUE.getbbox(val_str)
+        bb_num = _bb(FONT_OVERVIEW_VALUE, val_str)
         num_w  = bb_num[2] - bb_num[0]
         # Right-align within the reserved digit zone
         val_x  = val_right - max_num_w + (max_num_w - num_w)
@@ -624,6 +650,63 @@ def draw_node_section_overview(
                 [col_x, bar_y0, col_x + bar_w - 1, bar_y1],
                 fill=val_color,
             )
+
+
+# ── NumPy histogram renderer ─────────────────────────────────────────────────
+
+# Pre-built colour arrays (RGB tuples as uint8 numpy rows) for the 3 bands
+_HIST_FILL = np.array([
+    [0,  51, 25],   # < 50  fill  #003319
+    [61, 46,  0],   # < 75  fill  #3D2E00
+    [61,  0,  0],   # >= 75 fill  #3D0000
+], dtype=np.uint8)
+
+_HIST_TOP = np.array([
+    [0,  255, 136],  # < 50  top  #00FF88
+    [255, 204,  0],  # < 75  top  #FFCC00
+    [255,  68, 68],  # >= 75 top  #FF4444
+], dtype=np.uint8)
+
+
+def _draw_histogram_np(
+    draw: ImageDraw.ImageDraw,
+    cx: int,
+    hist_y0: int,
+    hist_y1: int,
+    hist_w: int,
+    history: Deque[float],
+) -> None:
+    """Render CPU histogram into the draw image using NumPy array writes."""
+    hist_h = hist_y1 - hist_y0
+    cols   = min(len(history), hist_w)
+
+    # Build a (hist_h, hist_w, 3) array; start fully dark
+    arr = np.empty((hist_h, hist_w, 3), dtype=np.uint8)
+    arr[:] = (8, 8, 8)  # #080808 background
+
+    if cols == 0:
+        draw._image.paste(Image.fromarray(arr, "RGB"), (cx, hist_y0))  # type: ignore[attr-defined]
+        return
+
+    vals = np.fromiter(history, dtype=np.float32, count=len(history))
+    vals = vals[-cols:]                               # rightmost `cols` samples
+    bar_heights = np.maximum(1, (vals * (hist_h / 100.0)).astype(np.int32))
+
+    # Colour band index per column: 0 (<50), 1 (<75), 2 (>=75)
+    band = np.where(vals < 50, 0, np.where(vals < 75, 1, 2))
+    fill_colors = _HIST_FILL[band]   # shape (cols, 3)
+    top_colors  = _HIST_TOP[band]    # shape (cols, 3)
+
+    offset = hist_w - cols
+    for i in range(cols):
+        bh      = int(bar_heights[i])
+        bar_top = hist_h - bh
+        col     = offset + i
+        if bh > 1:
+            arr[bar_top + 1:hist_h, col] = fill_colors[i]
+        arr[bar_top, col] = top_colors[i]
+
+    draw._image.paste(Image.fromarray(arr, "RGB"), (cx, hist_y0))  # type: ignore[attr-defined]
 
 
 # ── draw_node_section (used by _page_detail and directly) ────────────────────
@@ -678,35 +761,15 @@ def draw_node_section(
     ram_str = f"RAM {ram_usage:>3.0f}%" if ram_usage is not None else "RAM  --%"
     draw.text((cx + cw - 52, _hy), ram_str, font=FONT_HEADER_STAT, fill="#000000")
 
-    # Histogram
-    draw.rectangle([cx, hist_y0, cx + hist_w - 1, hist_y1], fill="#080808")
-
-    history = _hist_cpu[node_id]
-    cols    = min(len(history), hist_w)
-    slice_  = history[-cols:]
-
-    for i, val in enumerate(slice_):
-        col_x   = cx + (hist_w - cols) + i
-        bar_h   = max(1, int((val / 100.0) * hist_h))
-        bar_top = hist_y1 - bar_h
-
-        if val < 50:
-            fill_color, top_color = "#003319", "#00FF88"
-        elif val < 75:
-            fill_color, top_color = "#3D2E00", "#FFCC00"
-        else:
-            fill_color, top_color = "#3D0000", "#FF4444"
-
-        if bar_h > 1:
-            draw.line([(col_x, bar_top + 1), (col_x, hist_y1 - 1)], fill=fill_color)
-        draw.point((col_x, bar_top), fill=top_color)
+    # Histogram — rendered via NumPy into a sub-image then pasted
+    _draw_histogram_np(draw, cx, hist_y0, hist_y1, hist_w, _hist_cpu[node_id])
 
     draw.line([(cx, hist_y1), (cx + hist_w - 1, hist_y1)], fill=accent)
 
     if cpu_usage is not None:
         val_color = _health_color(cpu_usage)
         big_label = f"{cpu_usage:.0f}%"
-        bb  = FONT_BIG_VALUE.getbbox(big_label)
+        bb  = _bb(FONT_BIG_VALUE, big_label)
         tw  = bb[2] - bb[0]
         tx  = cx + hist_w - tw - 4
         ty  = hist_y1 - 1 - bb[3]
