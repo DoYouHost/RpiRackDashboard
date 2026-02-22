@@ -109,6 +109,7 @@ _simulator_mode: bool = False
 _device: Any = None
 _backlight: Any = None
 _current_brightness: float = 0.8
+_previous_brightness: float = 0.8  # Brightness to restore on next ON
 _transition_thread: Optional[threading.Thread] = None
 _transition_lock = threading.Lock()
 
@@ -175,8 +176,12 @@ def init_device(simulator_mode: bool):
 
 def set_backlight(value: float) -> None:
     """Set backlight brightness instantly. value is 0.0–1.0."""
-    global _current_brightness
-    _current_brightness = max(0.0, min(1.0, value))
+    global _current_brightness, _previous_brightness
+    value = max(0.0, min(1.0, value))
+    # Save current brightness before turning off, so it can be restored on next ON
+    if _current_brightness > 0.01 and value < 0.01:
+        _previous_brightness = _current_brightness
+    _current_brightness = value
     if _simulator_mode:
         _backlight.value = _current_brightness
     else:
@@ -207,6 +212,17 @@ def transition_backlight(target: float, duration_sec: float) -> None:
             target=_run, args=(target, duration_sec), daemon=True
         )
         _transition_thread.start()
+
+
+def get_previous_brightness() -> float:
+    """Get the brightness value to restore when light turns ON."""
+    return _previous_brightness
+
+
+def set_previous_brightness(value: float) -> None:
+    """Store brightness as the value to restore on next ON event."""
+    global _previous_brightness
+    _previous_brightness = max(0.0, min(1.0, value))
 
 
 def cleanup_device() -> None:

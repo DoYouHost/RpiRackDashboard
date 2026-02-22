@@ -13,7 +13,10 @@ from paho.mqtt.client import Client
 from logging_config import setup_logging
 from system_info import SystemInfoProducer
 from display_utils import page_manager, push_node_metrics, make_node_detail_page
-from display_device import init_device, set_backlight, transition_backlight, cleanup_device
+from display_device import (
+    init_device, set_backlight, transition_backlight, cleanup_device,
+    get_previous_brightness, set_previous_brightness
+)
 from node_mqtt import MultiNodeCollector, publish_node_metrics
 from ha_mqtt import setup_ha_entities
 
@@ -78,6 +81,8 @@ ha = setup_ha_entities(
     transition_backlight_fn=transition_backlight,
     page_next_fn=page_manager.next,
     page_prev_fn=page_manager.prev,
+    get_previous_brightness_fn=get_previous_brightness,
+    set_previous_brightness_fn=set_previous_brightness,
 )
 
 # Shared render-time measurement
@@ -222,8 +227,17 @@ def display_loop() -> None:
                 global _last_render_ms
                 _last_render_ms = _render_ms
 
+            # Auto-return to overview after 30 seconds without user navigation
+            elapsed_since_nav = time.monotonic() - page_manager.last_nav_time
+            if elapsed_since_nav > 30.0 and page_manager.current_name != "overview":
+                page_manager.go_to_overview()
+
             # Run faster during page switching so the switcher commits promptly
-            time.sleep(0.2 if page_manager.is_switching else 1.0)
+            if page_manager.is_switching:
+                time.sleep(0.2)
+            else:
+                page_manager.wake_event.wait(timeout=1.0)
+                page_manager.wake_event.clear()
     except KeyboardInterrupt:
         logger.info("Display loop interrupted")
         raise

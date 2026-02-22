@@ -23,12 +23,21 @@ FONT_HIST_LABEL  = _load(_MONO_REGULAR,  9)
 FONT_PAGE_TITLE  = _load(_MONO_BOLD,    12)
 
 # ── Overview-page exclusive fonts ─────────────────────────────────────────────
-FONT_OVERVIEW_VALUE  = _load(_MONO_BOLD,    40)   # big metric numbers
+# 3-node layout (row ~80px) — 3-column, node-bar 46px, col_w 76px
+# 36pt: "100"=65px + 2gap + "%"=8px = 75px ≤ 76px ✓
+FONT_OVERVIEW_VALUE  = _load(_MONO_BOLD,    36)   # big metric numbers
 FONT_OVERVIEW_UNIT   = _load(_MONO_BOLD,    12)   # '%' and '°' after numbers
 FONT_OVERVIEW_LABEL  = _load(_MONO_REGULAR, 10)   # 'CPU'/'RAM'/'TMP' labels
 FONT_OVERVIEW_NODEID = _load(_MONO_BOLD,    24)   # 'N1'/'N2'/'N3'
 FONT_DETAIL_STAT     = _load(_MONO_BOLD,    28)   # secondary stats on detail page
 FONT_STAT_GRID       = _load(_MONO_BOLD,    22)   # 2-row grid stats on detail page
+
+# 1- and 2-node layout — 3-column, node-bar 30px, col_w 82px
+# 40pt: "100"=72px + 2gap + "%"=8px = 82px ≤ 82px ✓  (all 3 metrics same size)
+FONT_OV_WIDE_VALUE  = _load(_MONO_BOLD,    40)
+FONT_OV_WIDE_UNIT   = _load(_MONO_BOLD,    12)
+FONT_OV_WIDE_LABEL  = _load(_MONO_REGULAR, 10)
+FONT_OV_WIDE_NODEID = _load(_MONO_BOLD,    24)   # 24pt "N1"=29px fits 30px bar
 
 # ── getbbox memoizer — font metric lookups are expensive; cache by (font, text) ─
 _BB: Dict[Any, Any] = {}
@@ -52,6 +61,7 @@ for _s in (
         FONT_OVERVIEW_VALUE, FONT_OVERVIEW_UNIT, FONT_OVERVIEW_LABEL,
         FONT_OVERVIEW_NODEID, FONT_HIST_LABEL, FONT_STAT_GRID,
         FONT_BIG_VALUE, FONT_HEADER_STAT, FONT_NODE_LABEL,
+        FONT_OV_WIDE_VALUE, FONT_OV_WIDE_UNIT, FONT_OV_WIDE_LABEL, FONT_OV_WIDE_NODEID,
     ):
         _bb(_f, _s)
 
@@ -119,6 +129,10 @@ class PageManager:
         # Cached switcher frame — built once per switch, blitted on every
         # subsequent render call until the dwell expires.
         self._switcher_cache: Optional[Image.Image] = None
+        # Event to wake the display loop immediately when page nav is triggered
+        self._wake_event: threading.Event = threading.Event()
+        # Track time of last navigation for inactivity timeout
+        self._last_nav_time: float = time.monotonic()
 
     # ── Registration ─────────────────────────────────────────────────────────
 
@@ -163,6 +177,7 @@ class PageManager:
         with self._lock:
             if not self._pages:
                 return
+            self._last_nav_time = time.monotonic()
             base = self._target_index if self._switching else self._index
             self._start_switch((base + 1) % len(self._pages))
 
@@ -170,6 +185,7 @@ class PageManager:
         with self._lock:
             if not self._pages:
                 return
+            self._last_nav_time = time.monotonic()
             base = self._target_index if self._switching else self._index
             self._start_switch((base - 1) % len(self._pages))
 
@@ -179,6 +195,16 @@ class PageManager:
         self._target_index    = target
         self._switch_started  = time.monotonic()
         self._switcher_cache  = None   # invalidate cache; rebuilt on next render
+        self._wake_event.set()  # wake the display loop immediately
+
+    def go_to_overview(self) -> None:
+        """Force navigation to the overview page."""
+        with self._lock:
+            overview_idx = next((i for i, (name, _) in enumerate(self._pages)
+                               if name == "overview"), None)
+            if overview_idx is not None and overview_idx != self._index:
+                self._last_nav_time = time.monotonic()
+                self._start_switch(overview_idx)
 
     # ── Properties ───────────────────────────────────────────────────────────
 
@@ -186,6 +212,15 @@ class PageManager:
     def is_switching(self) -> bool:
         with self._lock:
             return self._switching
+
+    @property
+    def wake_event(self) -> threading.Event:
+        return self._wake_event
+
+    @property
+    def last_nav_time(self) -> float:
+        with self._lock:
+            return self._last_nav_time
 
     @property
     def current_name(self) -> str:
@@ -352,6 +387,7 @@ def _page_overview(draw: ImageDraw.ImageDraw, width: int, height: int,
         draw_node_section_overview(
             draw,
             row_y=row_y,
+            node_height=node_height,
             node_id=node_id,
             cpu_usage=node_info.get("cpu_usage"),
             ram_usage=node_info.get("ram_usage"),
@@ -613,18 +649,94 @@ def _page_detail(draw: ImageDraw.ImageDraw, width: int, height: int,
 
 
 # ── Overview page layout constants ───────────────────────────────────────────
-_OV_LEFT_BAR_X0         = 20
-_OV_NODEID_X0           = 28    # start of node-id zone
-_OV_NODEID_ZONE         = 38    # width of zone (x=28..65)
-_OV_COL_STARTS          = (68, 146, 224)   # CPU, RAM, TMP column left edges (2px gaps)
-_OV_COL_W               = 76
-_OV_COL_LABELS          = ("CPU", "RAM", "TMP")
-_OV_COL_UNITS           = ("%", "%", "\u00b0C")
-_OV_LABEL_DRAW_Y_OFFSET = 1
-_OV_VALUE_DRAW_Y_OFFSET = 20
-_OV_UNIT_GAP            = 2
-_OV_BAR_Y0_OFFSET       = 74
-_OV_BAR_HEIGHT          = 5
+# ── Layout constants ─────────────────────────────────────────────────────────
+_OV_LEFT_BAR_X0 = 20
+_OV_UNIT_GAP    = 2
+
+# 3-node: node-bar x=20..65 (46px), 3 cols × 76px with 2px gaps
+# 36pt "100"=65px + 2 + "%"=8px = 75px ≤ 76px ✓
+_OV_NODEID_X0   = 28
+_OV_NODEID_ZONE = 38
+_OV_COL_STARTS  = (68, 146, 224)
+_OV_COL_W       = 76
+
+# 1/2-node wide: node-bar x=20..49 (30px), 3 cols × 82px with 2px gaps
+# 40pt "100"=72px + 2 + "%"=8px = 82px ≤ 82px ✓  (all 3 metrics same size)
+_OV_WIDE_BAR_X1  = 49
+_OV_WIDE_COL_W   = 82
+_OV_WIDE_COL_A   = 50
+_OV_WIDE_COL_B   = 134   # 50 + 82 + 2
+_OV_WIDE_COL_C   = 218   # 50 + 82 + 2 + 82 + 2
+
+
+def _draw_value_and_unit(
+    draw: ImageDraw.ImageDraw,
+    col_x: int, col_w: int,
+    val_y: int,
+    val_str: str, unit: str,
+    max_str: str,
+    val_color: str,
+    f_val: ImageFont.FreeTypeFont,
+    f_unit: ImageFont.FreeTypeFont,
+) -> None:
+    """Right-align value+unit within col. Value is right-aligned to the reserved
+    max-width slot; unit sits flush against the column's right edge."""
+    bb_max  = _bb(f_val, max_str)
+    max_w   = bb_max[2] - bb_max[0]
+    bb_unit = _bb(f_unit, unit)
+    unit_w  = bb_unit[2] - bb_unit[0]
+    col_r   = col_x + col_w - 1
+    unit_x  = col_r - unit_w
+    # Value right-aligns within the max-width slot ending at unit_x - gap
+    slot_r  = unit_x - _OV_UNIT_GAP
+    bb_num  = _bb(f_val, val_str)
+    num_w   = bb_num[2] - bb_num[0]
+    val_x    = max(col_x, slot_r - max_w + (max_w - num_w))
+    draw.text((val_x, val_y), val_str, font=f_val, fill=val_color)
+    if val_str != "--":
+        # Bottom-align unit with the value glyph
+        bb_val_ref = _bb(f_val, max_str)
+        unit_y = val_y + (bb_val_ref[3] - bb_unit[3])
+        draw.text((unit_x, unit_y), unit, font=f_unit, fill="#888888")
+
+
+def _draw_metric_col(
+    draw: ImageDraw.ImageDraw,
+    col_x: int, col_w: int,
+    content_y0: int, val_y: int,
+    bar_y0: int, bar_y1: int,
+    label: str, unit: str,
+    raw_val: Optional[float],
+    f_val: ImageFont.FreeTypeFont,
+    f_unit: ImageFont.FreeTypeFont,
+    f_label: ImageFont.FreeTypeFont,
+    is_temp: bool = False,
+) -> None:
+    """Draw label + big value+unit + progress bar for one metric."""
+    val_color = (
+        _health_color_temp(raw_val) if (is_temp and raw_val is not None)
+        else _health_color(raw_val) if raw_val is not None
+        else "#444444"
+    )
+    val_str = str(int(raw_val)) if raw_val is not None else "--"
+    max_str = "99" if is_temp else "100"
+
+    # Label centred horizontally
+    bb_lab = _bb(f_label, label)
+    lab_x  = col_x + (col_w - (bb_lab[2] - bb_lab[0])) // 2
+    draw.text((lab_x, content_y0), label, font=f_label, fill="#AAAAAA")
+
+    _draw_value_and_unit(
+        draw, col_x, col_w, val_y,
+        val_str, unit, max_str, val_color, f_val, f_unit,
+    )
+
+    # Progress bar
+    draw.rectangle([col_x, bar_y0, col_x + col_w - 1, bar_y1], fill="#1A1A1A")
+    if raw_val is not None:
+        frac  = max(0.0, min(1.0, raw_val / (80.0 if is_temp else 100.0)))
+        bar_w = max(1, int(frac * col_w))
+        draw.rectangle([col_x, bar_y0, col_x + bar_w - 1, bar_y1], fill=val_color)
 
 
 def draw_node_section_overview(
@@ -634,92 +746,100 @@ def draw_node_section_overview(
     cpu_usage: Optional[float],
     ram_usage: Optional[float],
     cpu_temp: Optional[float],
+    node_height: int = 80,
 ) -> None:
-    """Draw one node row for the overview page (no histogram).
+    """Draw one node row for the overview page.
 
-    Shows CPU%, RAM%, Temp as large 35pt numbers readable at ~1m on
-    a 1.69" ST7789 display. Does NOT push to histogram ring buffers.
+    ≤ 2 nodes (row ≥ 105px): 2-column layout — CPU | RAM at 60pt, TEMP as
+                               a compact subtitle below the RAM value.
+      3 nodes  (row  ~80px): 3-column layout — CPU | RAM | TMP at 36pt.
     """
-    accent   = NODE_COLORS.get(node_id, _DEFAULT_COLOR)
-    node_num = node_id.replace("node", "")
+    accent     = NODE_COLORS.get(node_id, _DEFAULT_COLOR)
+    node_label = f"N{node_id.replace('node', '')}"
 
-    # Node ID zone: filled accent rectangle, black text centered in the rectangle
-    node_label = f"N{node_num}"
-    bb_nid  = _bb(FONT_OVERVIEW_NODEID, node_label)
-    nid_w   = bb_nid[2] - bb_nid[0]
-    nid_h   = bb_nid[3] - bb_nid[1]
-    rect_w  = _OV_NODEID_X0 + _OV_NODEID_ZONE - _OV_LEFT_BAR_X0   # = 65 - 20 = 46px
-    nid_x   = _OV_LEFT_BAR_X0 + (rect_w - nid_w) // 2 - bb_nid[0]
-    nid_y   = row_y + (80 - nid_h) // 2 - bb_nid[1]
-    draw.rectangle([_OV_LEFT_BAR_X0, row_y, _OV_NODEID_X0 + _OV_NODEID_ZONE - 1, row_y + 79], fill=accent)
-    draw.text((nid_x, nid_y), node_label, font=FONT_OVERVIEW_NODEID, fill="#000000")
+    bar_h  = max(4, node_height // 16)
+    bar_y0 = row_y + node_height - bar_h - 1
+    bar_y1 = bar_y0 + bar_h - 1
 
-    # Metric columns
-    raw_vals: tuple = (cpu_usage, ram_usage, cpu_temp)
-    for col_idx, (col_x, label, unit, raw_val) in enumerate(
-        zip(_OV_COL_STARTS, _OV_COL_LABELS, _OV_COL_UNITS, raw_vals)
-    ):
-        # Small label at top of column
-        bb_lab = _bb(FONT_OVERVIEW_LABEL, label)
-        lab_w  = bb_lab[2] - bb_lab[0]
-        lab_x  = col_x + (_OV_COL_W - lab_w) // 2
-        draw.text(
-            (lab_x, row_y + _OV_LABEL_DRAW_Y_OFFSET),
-            label,
-            font=FONT_OVERVIEW_LABEL,
-            fill="#AAAAAA",
-        )
+    if node_height >= 105:
+        # ── Wide 3-column layout (1 or 2 nodes) ──────────────────────────────
+        # node-bar 30px, 3 cols × 82px — all metrics same 40pt size
+        f_val   = FONT_OV_WIDE_VALUE   # 40pt
+        f_unit  = FONT_OV_WIDE_UNIT    # 12pt
+        f_label = FONT_OV_WIDE_LABEL   # 10pt
+        f_nid   = FONT_OV_WIDE_NODEID  # 24pt
 
-        # Big value — right-aligned with reserved digit space
-        # Max strings: "100" for CPU/RAM (3 digits), "99" for TMP (2 digits)
-        max_str   = "99" if col_idx == 2 else "100"
-        bb_max    = _bb(FONT_OVERVIEW_VALUE, max_str)
-        max_num_w = bb_max[2] - bb_max[0]
-        bb_unit   = _bb(FONT_OVERVIEW_UNIT, unit)
-        unit_w    = bb_unit[2] - bb_unit[0]
-        # Right edge of the unit lands at col right edge; value sits left of unit
-        col_right = col_x + _OV_COL_W - 1
-        unit_x    = col_right - unit_w
-        val_right = unit_x - _OV_UNIT_GAP   # value right-aligns here
+        # Node-bar (30px)
+        bb_nid    = _bb(f_nid, node_label)
+        bar_rect_w = _OV_WIDE_BAR_X1 - _OV_LEFT_BAR_X0 + 1
+        nid_x = _OV_LEFT_BAR_X0 + (bar_rect_w - (bb_nid[2] - bb_nid[0])) // 2 - bb_nid[0]
+        nid_y = row_y + (node_height - (bb_nid[3] - bb_nid[1])) // 2 - bb_nid[1]
+        draw.rectangle([_OV_LEFT_BAR_X0, row_y, _OV_WIDE_BAR_X1, row_y + node_height - 1], fill=accent)
+        draw.text((nid_x, nid_y), node_label, font=f_nid, fill="#000000")
 
-        if raw_val is not None:
-            val_str   = str(int(raw_val))
-            val_color = _health_color_temp(raw_val) if col_idx == 2 else _health_color(raw_val)
-        else:
-            val_str   = "--"
-            val_color = "#444444"
+        # Shared vertical layout
+        bb_val_ref = _bb(f_val, "100")
+        val_h      = bb_val_ref[3] - bb_val_ref[1]
+        bb_lab_ref = _bb(f_label, "CPU")
+        lab_h      = bb_lab_ref[3] - bb_lab_ref[1]
+        content_h  = lab_h + 2 + val_h
+        content_y0 = row_y + (node_height - bar_h - 2 - content_h) // 2
+        val_y      = content_y0 + lab_h + 2
 
-        bb_num = _bb(FONT_OVERVIEW_VALUE, val_str)
-        num_w  = bb_num[2] - bb_num[0]
-        # Right-align within the reserved digit zone
-        val_x  = val_right - max_num_w + (max_num_w - num_w)
-
-        draw.text(
-            (val_x, row_y + _OV_VALUE_DRAW_Y_OFFSET),
-            val_str,
-            font=FONT_OVERVIEW_VALUE,
-            fill=val_color,
-        )
-
-        # Unit char flush right in column
-        if raw_val is not None:
-            draw.text(
-                (unit_x, row_y + _OV_VALUE_DRAW_Y_OFFSET),
-                unit,
-                font=FONT_OVERVIEW_UNIT,
-                fill="#888888",
+        for col_idx, (col_x, label, unit) in enumerate(
+            zip((_OV_WIDE_COL_A, _OV_WIDE_COL_B, _OV_WIDE_COL_C),
+                ("CPU", "RAM", "TMP"), ("%", "%", "\u00b0C"))
+        ):
+            raw_val = (cpu_usage, ram_usage, cpu_temp)[col_idx]
+            _draw_metric_col(
+                draw,
+                col_x=col_x, col_w=_OV_WIDE_COL_W,
+                content_y0=content_y0, val_y=val_y,
+                bar_y0=bar_y0, bar_y1=bar_y1,
+                label=label, unit=unit, raw_val=raw_val,
+                f_val=f_val, f_unit=f_unit, f_label=f_label,
+                is_temp=(col_idx == 2),
             )
 
-        # 6px progress bar at row bottom
-        bar_y0 = row_y + _OV_BAR_Y0_OFFSET
-        bar_y1 = bar_y0 + _OV_BAR_HEIGHT - 1
-        draw.rectangle([col_x, bar_y0, col_x + _OV_COL_W - 1, bar_y1], fill="#1A1A1A")
-        if raw_val is not None:
-            frac  = max(0.0, min(1.0, raw_val / (80.0 if col_idx == 2 else 100.0)))
-            bar_w = max(1, int(frac * _OV_COL_W))
-            draw.rectangle(
-                [col_x, bar_y0, col_x + bar_w - 1, bar_y1],
-                fill=val_color,
+    else:
+        # ── Standard 3-column layout (3 nodes, row ~80px) ────────────────────
+        f_val   = FONT_OVERVIEW_VALUE   # 36pt
+        f_unit  = FONT_OVERVIEW_UNIT    # 12pt
+        f_label = FONT_OVERVIEW_LABEL   # 10pt
+        f_nid   = FONT_OVERVIEW_NODEID  # 24pt
+
+        # Node-bar (46px: x=20..65)
+        bb_nid = _bb(f_nid, node_label)
+        rect_w = _OV_NODEID_X0 + _OV_NODEID_ZONE - _OV_LEFT_BAR_X0
+        nid_x  = _OV_LEFT_BAR_X0 + (rect_w - (bb_nid[2] - bb_nid[0])) // 2 - bb_nid[0]
+        nid_y  = row_y + (node_height - (bb_nid[3] - bb_nid[1])) // 2 - bb_nid[1]
+        draw.rectangle(
+            [_OV_LEFT_BAR_X0, row_y, _OV_NODEID_X0 + _OV_NODEID_ZONE - 1, row_y + node_height - 1],
+            fill=accent,
+        )
+        draw.text((nid_x, nid_y), node_label, font=f_nid, fill="#000000")
+
+        # Shared vertical layout
+        bb_val_ref = _bb(f_val, "100")
+        val_h      = bb_val_ref[3] - bb_val_ref[1]
+        bb_lab_ref = _bb(f_label, "CPU")
+        lab_h      = bb_lab_ref[3] - bb_lab_ref[1]
+        content_h  = lab_h + 2 + val_h
+        content_y0 = row_y + (node_height - bar_h - 2 - content_h) // 2
+        val_y      = content_y0 + lab_h + 2
+
+        for col_idx, (col_x, label, unit) in enumerate(
+            zip(_OV_COL_STARTS, ("CPU", "RAM", "TMP"), ("%", "%", "\u00b0C"))
+        ):
+            raw_val = (cpu_usage, ram_usage, cpu_temp)[col_idx]
+            _draw_metric_col(
+                draw,
+                col_x=col_x, col_w=_OV_COL_W,
+                content_y0=content_y0, val_y=val_y,
+                bar_y0=bar_y0, bar_y1=bar_y1,
+                label=label, unit=unit, raw_val=raw_val,
+                f_val=f_val, f_unit=f_unit, f_label=f_label,
+                is_temp=(col_idx == 2),
             )
 
 

@@ -29,6 +29,8 @@ def setup_ha_entities(
     transition_backlight_fn: Callable[[float, float], None],
     page_next_fn: Callable[[], None],
     page_prev_fn: Callable[[], None],
+    get_previous_brightness_fn: Callable[[], float] = None,
+    set_previous_brightness_fn: Callable[[float], None] = None,
 ) -> HAEntities:
     """Initialize all Home Assistant MQTT entities.
 
@@ -81,17 +83,22 @@ def setup_ha_entities(
                     logger.warning("Brightness value must be between 0 and 255.")
             elif "state" in payload:
                 if payload["state"] == light_info.payload_on:
+                    target_brightness = (
+                        get_previous_brightness_fn() if get_previous_brightness_fn else 0.8
+                    )
                     if transition > 0:
-                        transition_backlight_fn(0.8, transition)
+                        transition_backlight_fn(target_brightness, transition)
                     else:
-                        set_backlight_fn(0.8)
+                        set_backlight_fn(target_brightness)
                     entities.light.on()
+                    logger.info("Light ON, restored to brightness %.2f", target_brightness)
                 else:
                     if transition > 0:
                         transition_backlight_fn(0.0, transition)
                     else:
                         set_backlight_fn(0.0)
                     entities.light.off()
+                    logger.info("Light OFF")
             else:
                 logger.warning("Unsupported command for backlight. Only 'brightness', 'state' or 'transition' are accepted.")
 
