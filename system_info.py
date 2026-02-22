@@ -1,5 +1,6 @@
 """System information gathering module with producer-consumer pattern and multi-node support"""
 
+import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from collections import deque
@@ -8,6 +9,8 @@ import queue
 import socket
 import psutil
 import time
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -622,7 +625,7 @@ class SystemInfoProducer:
                     for subscriber_queue in self._subscribers:
                         subscriber_queue.put_nowait(sys_info)
             except Exception as e:
-                print(f"Error in producer: {e}")
+                logger.error("Error in producer: %s", e)
 
             # Sleep for the update interval
             for _ in range(int(self.update_interval * 10)):
