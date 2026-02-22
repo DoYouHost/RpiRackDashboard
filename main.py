@@ -12,7 +12,7 @@ from paho.mqtt.client import Client
 
 from logging_config import setup_logging
 from system_info import SystemInfoProducer
-from display_utils import page_manager, push_node_metrics
+from display_utils import page_manager, push_node_metrics, make_node_detail_page
 from display_device import init_device, set_backlight, transition_backlight, cleanup_device
 from node_mqtt import MultiNodeCollector, publish_node_metrics
 from ha_mqtt import setup_ha_entities
@@ -23,7 +23,10 @@ setup_logging()
 
 logger = logging.getLogger(__name__)
 
-SIMULATOR_MODE = os.getenv("SIMULATOR_MODE", "false").lower() == "true"
+SIMULATOR_MODE        = os.getenv("SIMULATOR_MODE", "false").lower() == "true"
+OFFLINE_REMOVE_HOURS  = float(os.getenv("OFFLINE_REMOVE_HOURS", "24"))
+_ONLINE_THRESHOLD_SEC = 30.0
+_REMOVE_THRESHOLD_SEC = OFFLINE_REMOVE_HOURS * 3600
 
 # ============================================================================
 # Initialization
@@ -50,6 +53,11 @@ NODES = {
 }
 
 node_collector = MultiNodeCollector(NODES)
+
+# node1 is the local machine — always online, register its detail page at startup
+_registered_node_pages: set = {"node1"}
+page_manager.register("node1 detail", make_node_detail_page("node1"))
+
 mqtt_host = os.getenv("MQTT_HOST")
 if mqtt_host:
     node_collector.setup(
@@ -108,6 +116,29 @@ if SIMULATOR_MODE:
     logger.info("Simulator mode: Generating mock node data every second")
 
 # ============================================================================
+# Dynamic Page Management
+# ============================================================================
+
+def _sync_node_pages() -> None:
+    """Add/remove per-node detail pages based on MQTT last-seen timestamps."""
+    now = time.time()
+    for node_id in NODES:
+        if node_id == "node1":
+            continue  # always registered
+        last_seen = node_collector.get_last_seen(node_id)
+        if last_seen is None:
+            continue  # never seen; don't register yet
+        page_name = f"{node_id} detail"
+        if node_id not in _registered_node_pages:
+            page_manager.register(page_name, make_node_detail_page(node_id))
+            _registered_node_pages.add(node_id)
+            logger.info("Registered detail page for %s", node_id)
+        elif now - last_seen > _REMOVE_THRESHOLD_SEC:
+            page_manager.unregister(page_name)
+            _registered_node_pages.discard(node_id)
+            logger.info("Removed detail page for %s (offline > %.0fh)", node_id, OFFLINE_REMOVE_HOURS)
+
+# ============================================================================
 # Main Loops
 # ============================================================================
 
@@ -137,10 +168,27 @@ def display_loop() -> None:
             if SIMULATOR_MODE:
                 generate_mock_data()
 
+            # Sync per-node detail pages with current availability
+            _sync_node_pages()
+
+            now = time.time()
+
+            # Overview shows only online nodes (node1 always + online MQTT nodes), max 3
+            online_mqtt = [
+                nid for nid in NODES if nid != "node1"
+                and (ls := node_collector.get_last_seen(nid)) is not None
+                and now - ls <= _ONLINE_THRESHOLD_SEC
+            ]
+            overview_node_ids = (["node1"] + online_mqtt)[:3]
+
             # Build page data for all nodes
             page_data: Dict[str, Any] = {
-                "node_ids":   list(NODES.keys()),
-                "detail_node": list(NODES.keys())[0],
+                "node_ids":    overview_node_ids,
+                "detail_node": "node1",  # fallback; factory pages override via closure
+                "node_last_seen": {
+                    nid: node_collector.get_last_seen(nid)
+                    for nid in NODES if nid != "node1"
+                },
             }
             for node_id in NODES:
                 info = node_collector.get_node_info(node_id)

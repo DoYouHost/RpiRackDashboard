@@ -2,7 +2,8 @@
 
 import logging
 import threading
-from typing import Dict, Optional
+import time
+from typing import Dict, List, Optional
 
 from paho.mqtt.client import Client, MQTTMessage
 
@@ -41,6 +42,7 @@ class MultiNodeCollector:
         self.nodes = nodes
         self.client = mqtt_client or Client()
         self.latest_metrics: Dict[str, dict] = {node: {} for node in nodes}
+        self._last_seen: Dict[str, float] = {}
         self._lock = threading.Lock()
         self.running = False
 
@@ -88,8 +90,20 @@ class MultiNodeCollector:
                 display_key = _DISPLAY_KEY_MAP.get(suffix)
                 if display_key:
                     self.latest_metrics[node_id][display_key] = value
+                self._last_seen[node_id] = time.time()
         except Exception as e:
             logger.error("Error processing MQTT message: %s", e)
+
+    def get_last_seen(self, node_id: str) -> Optional[float]:
+        """Return Unix timestamp of last received MQTT message, or None if never seen."""
+        with self._lock:
+            return self._last_seen.get(node_id)
+
+    def get_online_nodes(self, timeout_sec: float = 30.0) -> List[str]:
+        """Return node_ids that sent a message within the last timeout_sec seconds."""
+        now = time.time()
+        with self._lock:
+            return [nid for nid, ts in self._last_seen.items() if now - ts <= timeout_sec]
 
     def get_node_info(self, node_id: str) -> SystemInfo:
         """Get latest metrics for a node as SystemInfo.

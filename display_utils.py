@@ -125,6 +125,38 @@ class PageManager:
     def register(self, name: str, fn: PageFn) -> None:
         self._pages.append((name, fn))
 
+    def unregister(self, name: str) -> bool:
+        """Remove a page by name. Adjusts current index safely. Returns True if found."""
+        with self._lock:
+            idx = next((i for i, (n, _) in enumerate(self._pages) if n == name), None)
+            if idx is None:
+                return False
+            self._pages.pop(idx)
+            if not self._pages:
+                self._index = 0
+                self._target_index = 0
+                self._switching = False
+                self._switcher_cache = None
+                return True
+            # Adjust current index
+            if idx <= self._index:
+                self._index = max(0, self._index - 1)
+            self._index = min(self._index, len(self._pages) - 1)
+            # Adjust switching target
+            if self._switching:
+                if idx == self._target_index:
+                    self._switching = False
+                    self._switcher_cache = None
+                elif idx < self._target_index:
+                    self._target_index -= 1
+                self._target_index = min(self._target_index, len(self._pages) - 1)
+            return True
+
+    def get_names(self) -> list:
+        """Return list of currently registered page names."""
+        with self._lock:
+            return [name for name, _ in self._pages]
+
     # ── Navigation (thread-safe, called from button/keyboard) ────────────────
 
     def next(self) -> None:
@@ -279,6 +311,27 @@ def _build_switcher_image(
     return img
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _format_elapsed(seconds: float) -> str:
+    """Format seconds into a compact string: '5s', '3m', '2h', '1d'."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+
+
+def make_node_detail_page(node_id: str) -> "PageFn":
+    """Return a PageFn that always renders the detail view for the given node_id."""
+    def _fn(draw: ImageDraw.ImageDraw, width: int, height: int,
+            data: Dict[str, Any]) -> None:
+        _page_detail(draw, width, height, {**data, "detail_node": node_id})
+    return _fn
+
+
 # ── Page: overview (3-node histogram dashboard) ───────────────────────────────
 
 def _page_overview(draw: ImageDraw.ImageDraw, width: int, height: int,
@@ -368,15 +421,33 @@ def _page_detail(draw: ImageDraw.ImageDraw, width: int, height: int,
     net_rx_rate = node_info.get("net_rx_rate")
     load_avg_5  = node_info.get("load_avg_5")
 
+    # ── Offline status ────────────────────────────────────────────────────────
+    last_seen_ts = data.get("node_last_seen", {}).get(node_id)
+    is_offline   = False
+    offline_label = ""
+    if last_seen_ts is not None:
+        elapsed = time.time() - last_seen_ts
+        if elapsed > 30:
+            is_offline    = True
+            offline_label = _format_elapsed(elapsed)
+
     # ── Title bar ─────────────────────────────────────────────────────────────
     # Slimmed to 24px (was 30): 24pt font visual height ~18px, 3px padding each side
-    TITLE_H = 24
-    draw.rectangle([20, 0, 299, TITLE_H - 1], fill=accent)
+    TITLE_H   = 24
+    bar_fill  = "#3A0000" if is_offline else accent
+    txt_fill  = "#FFFFFF" if is_offline else "#000000"
+    draw.rectangle([20, 0, 299, TITLE_H - 1], fill=bar_fill)
     title = f"NODE {node_num}"
     bb_t  = _bb(FONT_OVERVIEW_NODEID, title)
     tx    = 20 + (280 - (bb_t[2] - bb_t[0])) // 2 - bb_t[0]
     ty    = (TITLE_H - (bb_t[3] - bb_t[1])) // 2 - bb_t[1]
-    draw.text((tx, ty), title, font=FONT_OVERVIEW_NODEID, fill="#000000")
+    draw.text((tx, ty), title, font=FONT_OVERVIEW_NODEID, fill=txt_fill)
+    if is_offline:
+        tag    = f"OFFLINE {offline_label}"
+        bb_tag = _bb(FONT_HIST_LABEL, tag)
+        tag_x  = 299 - (bb_tag[2] - bb_tag[0]) - 4
+        tag_y  = (TITLE_H - (bb_tag[3] - bb_tag[1])) // 2 - bb_tag[1]
+        draw.text((tag_x, tag_y), tag, font=FONT_HIST_LABEL, fill="#FF6644")
 
     # ── Big metric columns (CPU / RAM / TEMP) ─────────────────────────────────
     # 3 cols × 92px + 2 gaps × 2px = 280px (x=20..299)
@@ -798,4 +869,4 @@ def push_node_metrics(node_id: str, cpu_usage: Optional[float], ram_usage: Optio
 
 page_manager = PageManager()
 page_manager.register("overview", _page_overview)
-page_manager.register("detail",   _page_detail)
+# Per-node detail pages are registered dynamically from main.py
