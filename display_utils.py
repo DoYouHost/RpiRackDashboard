@@ -1,0 +1,738 @@
+"""Display rendering utilities for multi-node dashboard"""
+
+import os
+import time
+import threading
+from PIL import Image, ImageDraw, ImageFont
+from typing import Callable, Dict, List, Optional, Any, Tuple
+
+# ── Font loading ──────────────────────────────────────────────────────────────
+_FONT_DIR     = os.path.join(os.path.dirname(__file__), "fonts")
+_MONO_REGULAR = os.path.join(_FONT_DIR, "DejaVuSansMono.ttf")
+_MONO_BOLD    = os.path.join(_FONT_DIR, "DejaVuSansMono-Bold.ttf")
+
+def _load(path: str, size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(path, size)
+
+FONT_NODE_LABEL  = _load(_MONO_BOLD,    11)
+FONT_HEADER_STAT = _load(_MONO_REGULAR, 10)
+FONT_BIG_VALUE   = _load(_MONO_BOLD,    18)
+FONT_HIST_LABEL  = _load(_MONO_REGULAR,  9)
+FONT_PAGE_TITLE  = _load(_MONO_BOLD,    12)
+
+# ── Overview-page exclusive fonts ─────────────────────────────────────────────
+FONT_OVERVIEW_VALUE  = _load(_MONO_BOLD,    40)   # big metric numbers
+FONT_OVERVIEW_UNIT   = _load(_MONO_BOLD,    12)   # '%' and '°' after numbers
+FONT_OVERVIEW_LABEL  = _load(_MONO_REGULAR, 10)   # 'CPU'/'RAM'/'TMP' labels
+FONT_OVERVIEW_NODEID = _load(_MONO_BOLD,    24)   # 'N1'/'N2'/'N3'
+FONT_DETAIL_STAT     = _load(_MONO_BOLD,    28)   # secondary stats on detail page
+FONT_STAT_GRID       = _load(_MONO_BOLD,    22)   # 2-row grid stats on detail page
+
+# ── Per-node accent palette ───────────────────────────────────────────────────
+NODE_COLORS: Dict[str, str] = {
+    "node1": "#00FF88",
+    "node2": "#00CCFF",
+    "node3": "#FF44AA",
+}
+_DEFAULT_COLOR = "#FFFFFF"
+
+# ── Internal histogram ring buffers ───────────────────────────────────────────
+_hist_cpu: Dict[str, List[float]] = {}
+_hist_ram: Dict[str, List[float]] = {}
+_HIST_LEN = 320
+
+def _ensure_hist(node_id: str) -> None:
+    if node_id not in _hist_cpu:
+        _hist_cpu[node_id] = [0.0] * _HIST_LEN
+        _hist_ram[node_id] = [0.0] * _HIST_LEN
+
+def _push(buf: Dict[str, List[float]], node_id: str, value: Optional[float]) -> None:
+    buf[node_id].append(value if value is not None else 0.0)
+    if len(buf[node_id]) > _HIST_LEN:
+        buf[node_id].pop(0)
+
+def _health_color(value: float, low: float = 60, high: float = 85) -> str:
+    if value < low:
+        return "#00FF88"
+    elif value < high:
+        return "#FFCC00"
+    return "#FF4444"
+
+def _health_color_temp(value: float) -> str:
+    return _health_color(value, low=50, high=65)
+
+
+# ── Page system ───────────────────────────────────────────────────────────────
+# A page is a callable:  fn(draw, width, height, data) -> None
+# `data` is whatever dict the display loop passes in (node metrics, etc.)
+PageFn = Callable[[ImageDraw.ImageDraw, int, int, Dict[str, Any]], None]
+
+class PageManager:
+    """Holds an ordered list of pages with a static thumbnail switcher.
+
+    Calling next()/prev() triggers the switcher: all page thumbnails are
+    rendered once into a cached image and displayed for DWELL_SEC seconds,
+    then the new page commits.  No per-frame re-rendering during the dwell —
+    the cached frame is blitted directly, keeping Pi CPU usage low.
+    Thread-safe throughout.
+    """
+
+    # How long the switcher stays visible before committing (seconds).
+    # Keep generous — rendering on real hardware is slow.
+    DWELL_SEC = 2.5
+
+    def __init__(self) -> None:
+        self._pages: List[Tuple[str, PageFn]] = []
+        self._index: int = 0
+        self._lock  = threading.Lock()
+
+        # Transition state (guarded by _lock)
+        self._switching:      bool            = False
+        self._target_index:   int             = 0
+        self._switch_started: float           = 0.0
+        # Cached switcher frame — built once per switch, blitted on every
+        # subsequent render call until the dwell expires.
+        self._switcher_cache: Optional[Image.Image] = None
+
+    # ── Registration ─────────────────────────────────────────────────────────
+
+    def register(self, name: str, fn: PageFn) -> None:
+        self._pages.append((name, fn))
+
+    # ── Navigation (thread-safe, called from button/keyboard) ────────────────
+
+    def next(self) -> None:
+        with self._lock:
+            if not self._pages:
+                return
+            base = self._target_index if self._switching else self._index
+            self._start_switch((base + 1) % len(self._pages))
+
+    def prev(self) -> None:
+        with self._lock:
+            if not self._pages:
+                return
+            base = self._target_index if self._switching else self._index
+            self._start_switch((base - 1) % len(self._pages))
+
+    def _start_switch(self, target: int) -> None:
+        """Must be called with _lock held."""
+        self._switching       = True
+        self._target_index    = target
+        self._switch_started  = time.monotonic()
+        self._switcher_cache  = None   # invalidate cache; rebuilt on next render
+
+    # ── Properties ───────────────────────────────────────────────────────────
+
+    @property
+    def is_switching(self) -> bool:
+        with self._lock:
+            return self._switching
+
+    @property
+    def current_name(self) -> str:
+        with self._lock:
+            if not self._pages:
+                return ""
+            return self._pages[self._index][0]
+
+    @property
+    def page_count(self) -> int:
+        return len(self._pages)
+
+    # ── Rendering ────────────────────────────────────────────────────────────
+
+    def render(self, draw: ImageDraw.ImageDraw, width: int, height: int,
+               data: Dict[str, Any]) -> None:
+        with self._lock:
+            if not self._pages:
+                return
+            switching      = self._switching
+            index          = self._index
+            target         = self._target_index
+            elapsed        = time.monotonic() - self._switch_started
+            pages_snapshot = list(self._pages)
+
+            # Commit once dwell time is over
+            if switching and elapsed >= self.DWELL_SEC:
+                self._index          = target
+                self._switching      = False
+                self._switcher_cache = None
+                switching            = False
+                index                = target
+
+            # Build the switcher frame once and cache it
+            if switching and self._switcher_cache is None:
+                self._switcher_cache = _build_switcher_image(
+                    width, height, data, pages_snapshot, target,
+                )
+
+            cache = self._switcher_cache
+
+        if switching and cache is not None:
+            # Blit cached switcher — no per-frame page rendering
+            draw._image.paste(cache, (0, 0))  # type: ignore[attr-defined]
+        else:
+            _name, fn = pages_snapshot[index]
+            fn(draw, width, height, data)
+
+
+# ── Switcher overlay ──────────────────────────────────────────────────────────
+
+def _render_page_thumbnail(fn: PageFn, width: int, height: int,
+                           data: Dict[str, Any]) -> Image.Image:
+    """Render a page into a small off-screen buffer and return it."""
+    buf  = Image.new("RGB", (width, height), (0, 0, 0))
+    bdraw = ImageDraw.Draw(buf)
+    fn(bdraw, width, height, data)
+    return buf
+
+
+def _build_switcher_image(
+    width:  int,
+    height: int,
+    data:   Dict[str, Any],
+    pages:  List[Tuple[str, PageFn]],
+    target: int,
+) -> Image.Image:
+    """Render the switcher frame once and return it as an Image.
+
+    Called once per switch event; the result is cached by PageManager
+    and pasted on every subsequent render call during the dwell period.
+    No animated elements — static frame only to minimise Pi CPU load.
+    """
+    n   = len(pages)
+    img = Image.new("RGB", (width, height), (0, 0, 0))
+    d   = ImageDraw.Draw(img)
+
+    # Thumbnail dimensions
+    THUMB_W  = 72    # inactive  (320px / ~4 pages leaves room for gaps)
+    THUMB_H  = 54
+    ACTIVE_W = 100   # highlighted page is larger
+    ACTIVE_H = 75
+    GAP      = 8
+    LABEL_H  = 13
+
+    total_w = (n - 1) * (THUMB_W + GAP) + ACTIVE_W
+    start_x = (width - total_w) // 2
+    ty_dim  = (height - THUMB_H  - LABEL_H) // 2
+    ty_big  = (height - ACTIVE_H - LABEL_H) // 2
+
+    cx = start_x
+    for i, (name, fn) in enumerate(pages):
+        is_active = (i == target)
+        tw = ACTIVE_W if is_active else THUMB_W
+        th = ACTIVE_H if is_active else THUMB_H
+        ty = ty_big   if is_active else ty_dim
+
+        # Render the page at full resolution then downscale — done once only
+        thumb_full = _render_page_thumbnail(fn, width, height, data)
+        thumb      = thumb_full.resize((tw, th), Image.Resampling.LANCZOS)
+        img.paste(thumb, (cx, ty))
+
+        # Border: 2px bright white for active, 1px dim for inactive
+        border_color = "#FFFFFF" if is_active else "#444444"
+        border_px    = 2 if is_active else 1
+        for b in range(border_px):
+            d.rectangle(
+                [cx - b - 1, ty - b - 1, cx + tw + b, ty + th + b],
+                outline=border_color,
+            )
+
+        # Page name below thumbnail
+        bb      = FONT_HIST_LABEL.getbbox(name)
+        lw      = bb[2] - bb[0]
+        label_x = cx + (tw - lw) // 2
+        label_y = ty + th + 3
+        d.text((label_x, label_y), name,
+               font=FONT_HIST_LABEL,
+               fill="#FFFFFF" if is_active else "#666666")
+
+        cx += tw + GAP
+
+    return img
+
+
+# ── Page: overview (3-node histogram dashboard) ───────────────────────────────
+
+def _page_overview(draw: ImageDraw.ImageDraw, width: int, height: int,
+                   data: Dict[str, Any]) -> None:
+    nodes: List[str] = data.get("node_ids", [])
+    if not nodes:
+        return
+
+    node_height = height // len(nodes)
+
+    for idx, node_id in enumerate(nodes):
+        row_y     = idx * node_height
+        node_info = data.get(node_id, {})
+
+        if idx > 0:
+            draw.line([(20, row_y), (299, row_y)], fill="#2A2A2A", width=1)
+
+        draw_node_section_overview(
+            draw,
+            row_y=row_y,
+            node_id=node_id,
+            cpu_usage=node_info.get("cpu_usage"),
+            ram_usage=node_info.get("ram_usage"),
+            cpu_temp=node_info.get("cpu_temp"),
+        )
+
+
+# ── Arc gauge helper ──────────────────────────────────────────────────────────
+def _draw_arc_gauge(
+    draw: ImageDraw.ImageDraw,
+    cx: int, cy: int,
+    radius: int,
+    value: float,
+    color: str,
+    label: str,
+    val_str: str,
+    val_font: ImageFont.FreeTypeFont,
+    lbl_font: ImageFont.FreeTypeFont,
+    thickness: int = 5,
+) -> None:
+    """Draw a horseshoe arc gauge (200°–340°) centred at (cx, cy).
+
+    PIL angles: 0=3 o'clock, clockwise.
+    200°–340° is the lower arc (opens upward like a U).
+    cy is the arc centre — arc appears BELOW cy.
+    Label goes above cy, value inside the U below cy.
+    """
+    bbox = [cx - radius, cy - radius, cx + radius, cy + radius]
+
+    draw.arc(bbox, start=200, end=340, fill="#2A2A2A", width=thickness)
+
+    v = max(0.0, min(1.0, value))
+    if v > 0:
+        draw.arc(bbox, start=200, end=200 + 140 * v, fill=color, width=thickness)
+
+    # Label above cy
+    bb_l = lbl_font.getbbox(label)
+    lx = cx - (bb_l[2] - bb_l[0]) // 2 - bb_l[0]
+    ly = cy - (bb_l[3] - bb_l[1]) - 3
+    draw.text((lx, ly), label, font=lbl_font, fill="#AAAAAA")
+
+    # Value below cy, inside the U
+    bb_v = val_font.getbbox(val_str)
+    vx = cx - (bb_v[2] - bb_v[0]) // 2 - bb_v[0]
+    vy = cy + 4 - bb_v[1]
+    draw.text((vx, vy), val_str, font=val_font, fill=color)
+
+
+# ── Page: single-node detail ──────────────────────────────────────────────────
+# Shows one node at a time, full-screen histogram + extra stats.
+# `data["detail_node"]` controls which node is shown.
+
+def _page_detail(draw: ImageDraw.ImageDraw, width: int, height: int,
+                 data: Dict[str, Any]) -> None:
+    node_id   = data.get("detail_node", "node1")
+    node_info = data.get(node_id, {})
+    accent    = NODE_COLORS.get(node_id, _DEFAULT_COLOR)
+    node_num  = node_id.replace("node", "")
+
+    cpu_usage   = node_info.get("cpu_usage")
+    ram_usage   = node_info.get("ram_usage")
+    cpu_temp    = node_info.get("cpu_temp")
+    cpu_freq    = node_info.get("cpu_freq")
+    uptime      = node_info.get("uptime")
+    disk_usage  = node_info.get("disk_usage")
+    net_tx_rate = node_info.get("net_tx_rate")
+    net_rx_rate = node_info.get("net_rx_rate")
+    load_avg_5  = node_info.get("load_avg_5")
+
+    # ── Title bar ─────────────────────────────────────────────────────────────
+    # Slimmed to 24px (was 30): 24pt font visual height ~18px, 3px padding each side
+    TITLE_H = 24
+    draw.rectangle([20, 0, 299, TITLE_H - 1], fill=accent)
+    title = f"NODE {node_num}"
+    bb_t  = FONT_OVERVIEW_NODEID.getbbox(title)
+    tx    = 20 + (280 - (bb_t[2] - bb_t[0])) // 2 - bb_t[0]
+    ty    = (TITLE_H - (bb_t[3] - bb_t[1])) // 2 - bb_t[1]
+    draw.text((tx, ty), title, font=FONT_OVERVIEW_NODEID, fill="#000000")
+
+    # ── Big metric columns (CPU / RAM / TEMP) ─────────────────────────────────
+    # 3 cols × 92px + 2 gaps × 2px = 280px (x=20..299)
+    DT_COL_W      = 92
+    DT_COL_STARTS = (20, 114, 208)
+    DT_COL_LABELS = ("CPU", "RAM", "TMP")
+    DT_COL_UNITS  = ("%", "%", "\u00b0C")
+    DT_LABEL_Y    = TITLE_H + 4    # 28 — tighter spacing after slimmer title
+    DT_VALUE_Y    = TITLE_H + 14   # 38 — 40pt glyph visible y≈46..76
+    DT_BAR_Y0     = DT_VALUE_Y + 42  # 80 — 4px gap below glyph bottom
+    DT_BAR_Y1     = DT_BAR_Y0 + 5   # 85 — 6px tall bar
+    DT_UNIT_GAP   = 2
+
+    raw_vals = (cpu_usage, ram_usage, cpu_temp)
+    for col_idx, (col_x, label, unit, raw_val) in enumerate(
+        zip(DT_COL_STARTS, DT_COL_LABELS, DT_COL_UNITS, raw_vals)
+    ):
+        # Column label
+        bb_lab = FONT_OVERVIEW_LABEL.getbbox(label)
+        lab_w  = bb_lab[2] - bb_lab[0]
+        lab_x  = col_x + (DT_COL_W - lab_w) // 2
+        draw.text((lab_x, DT_LABEL_Y), label, font=FONT_OVERVIEW_LABEL, fill="#AAAAAA")
+
+        # Value — right-aligned, max digits 3/3/2
+        max_str   = "99" if col_idx == 2 else "100"
+        bb_max    = FONT_OVERVIEW_VALUE.getbbox(max_str)
+        max_num_w = bb_max[2] - bb_max[0]
+        bb_unit   = FONT_OVERVIEW_UNIT.getbbox(unit)
+        unit_w    = bb_unit[2] - bb_unit[0]
+        col_right = col_x + DT_COL_W - 1
+        unit_x    = col_right - unit_w
+        val_right = unit_x - DT_UNIT_GAP
+
+        if raw_val is not None:
+            val_str   = str(int(raw_val))
+            val_color = _health_color_temp(raw_val) if col_idx == 2 else _health_color(raw_val)
+        else:
+            val_str   = "--"
+            val_color = "#444444"
+
+        bb_num = FONT_OVERVIEW_VALUE.getbbox(val_str)
+        num_w  = bb_num[2] - bb_num[0]
+        val_x  = val_right - max_num_w + (max_num_w - num_w)
+
+        draw.text((val_x, DT_VALUE_Y), val_str, font=FONT_OVERVIEW_VALUE, fill=val_color)
+
+        if raw_val is not None:
+            draw.text((unit_x, DT_VALUE_Y), unit, font=FONT_OVERVIEW_UNIT, fill="#888888")
+
+        # Progress bar — 6px tall, identical style to overview page
+        draw.rectangle(
+            [col_x, DT_BAR_Y0, col_x + DT_COL_W - 1, DT_BAR_Y1],
+            fill="#1A1A1A",
+        )
+        if raw_val is not None:
+            frac  = max(0.0, min(1.0, raw_val / (80.0 if col_idx == 2 else 100.0)))
+            bar_w = max(1, int(frac * DT_COL_W))
+            draw.rectangle(
+                [col_x, DT_BAR_Y0, col_x + bar_w - 1, DT_BAR_Y1],
+                fill=val_color,
+            )
+
+    # ── Separator ─────────────────────────────────────────────────────────────
+    SEP_Y = DT_BAR_Y1 + 6   # 91 — anchored just below progress bars
+    draw.line([(20, SEP_Y), (299, SEP_Y)], fill="#2A2A2A", width=1)
+
+    # ── 3-column vertical dividers ─────────────────────────────────────────────
+    draw.line([(113, SEP_Y), (113, 239)], fill="#2A2A2A", width=1)
+    draw.line([(206, SEP_Y), (206, 239)], fill="#2A2A2A", width=1)
+
+    # ── Mid-row divider — full width across all 3 columns ─────────────────────
+    GRID_MID_Y = 166
+    draw.line([(20, GRID_MID_Y), (299, GRID_MID_Y)], fill="#2A2A2A", width=1)
+
+    # ── Layout constants ───────────────────────────────────────────────────────
+    # Col 2 (x=114..205, w=92) is a merged cell spanning both rows for NET↓/↑
+    NET_COL_X, NET_COL_W = 114, 92
+    # Two 73px rows (y=93..165 and y=167..239), content centred in each half
+    SSTAT_R2_LBL_Y = 185   # row 2 label top Y
+    SSTAT_R2_VAL_Y = 201   # row 2 value reference Y (before -bb[1] correction)
+
+    # ── Value strings ──────────────────────────────────────────────────────────
+    uptime_str = "--"
+    if uptime is not None:
+        uptime_seconds = int(time.time() - uptime)
+        if uptime_seconds < 3600:
+            uptime_str = f"{uptime_seconds // 60}m"
+        elif uptime_seconds < 86400:
+            uptime_str = f"{uptime_seconds // 3600}h"
+        else:
+            uptime_str = f"{uptime_seconds // 86400}d"
+
+    if disk_usage is not None:
+        disk_str   = f"{disk_usage:.0f}%"
+        disk_color = _health_color(disk_usage)
+    else:
+        disk_str   = "--"
+        disk_color = "#444444"
+
+    def _fmt_net(v: Optional[float]) -> str:
+        if v is None:
+            return "--"
+        if v < 1_000:
+            return f"{v:.0f}B"
+        if v < 1_000_000:
+            return f"{v / 1_000:.1f}K"
+        return f"{v / 1_000_000:.1f}M"
+
+    load_str = f"{load_avg_5:.2f}" if load_avg_5 is not None else "--"
+
+    if cpu_freq is not None:
+        freq_str = f"{cpu_freq/1000:.1f}GHz" if cpu_freq >= 1000 else f"{cpu_freq:.0f}MHz"
+    else:
+        freq_str = "--"
+
+    # ── Col 1 row 2 + Col 3 rows 1 & 2 + Col 1 row 1 (FREQ) ──────────────────
+    # Col 2 bottom row only: NET DN + NET UP stacked in y=167..239 (72px) ──────
+    # Each item: label ~12px + value ~20px = 32px each, gap 4px → 68px fits nicely.
+    for label, val_str, val_color, lbl_y, val_y in (
+        ("NET DN", _fmt_net(net_rx_rate), "#00FF88", 172, 184),
+        ("NET UP", _fmt_net(net_tx_rate), "#00CCFF", 206, 218),
+    ):
+        bb_sl = FONT_OVERVIEW_LABEL.getbbox(label)
+        sl_x  = NET_COL_X + (NET_COL_W - (bb_sl[2] - bb_sl[0])) // 2
+        draw.text((sl_x, lbl_y), label, font=FONT_OVERVIEW_LABEL, fill="#AAAAAA")
+
+        bb_sv = FONT_STAT_GRID.getbbox(val_str)
+        sv_x  = NET_COL_X + (NET_COL_W - (bb_sv[2] - bb_sv[0])) // 2 - bb_sv[0]
+        sv_y  = val_y - bb_sv[1]
+        draw.text((sv_x, sv_y), val_str, font=FONT_STAT_GRID, fill=val_color)
+
+    # Row 1 cell: y=93..165 (73px).
+    # Content: label(12) + gap(3) + radius(28) + gap(4) + value(26) = 73px → cy=136
+    freq_pct = (cpu_freq / 2400.0) if cpu_freq is not None else 0.0
+    _draw_arc_gauge(
+        draw, cx=66, cy=136, radius=28,
+        value=freq_pct, color="#CCCCCC",
+        label="FREQ", val_str=freq_str,
+        val_font=FONT_STAT_GRID, lbl_font=FONT_OVERVIEW_LABEL,
+    )
+
+    disk_pct = (disk_usage / 100.0) if disk_usage is not None else 0.0
+    _draw_arc_gauge(
+        draw, cx=252, cy=136, radius=28,
+        value=disk_pct, color=disk_color,
+        label="DISK", val_str=disk_str,
+        val_font=FONT_STAT_GRID, lbl_font=FONT_OVERVIEW_LABEL,
+    )
+
+    # ── Col 1 row 2 + Col 3 row 2: text stats ─────────────────────────────────
+    for (col_x, col_w), (label, val_str, val_color), lbl_y, val_y in (
+        ((20,  93), ("UPTIME", uptime_str, "#CCCCCC"), SSTAT_R2_LBL_Y, SSTAT_R2_VAL_Y),
+        ((206, 94), ("LOAD",   load_str,   "#CCCCCC"), SSTAT_R2_LBL_Y, SSTAT_R2_VAL_Y),
+    ):
+        bb_sl = FONT_OVERVIEW_LABEL.getbbox(label)
+        sl_x  = col_x + (col_w - (bb_sl[2] - bb_sl[0])) // 2
+        draw.text((sl_x, lbl_y), label, font=FONT_OVERVIEW_LABEL, fill="#AAAAAA")
+
+        bb_sv = FONT_STAT_GRID.getbbox(val_str)
+        sv_x  = col_x + (col_w - (bb_sv[2] - bb_sv[0])) // 2 - bb_sv[0]
+        sv_y  = val_y - bb_sv[1]
+        draw.text((sv_x, sv_y), val_str, font=FONT_STAT_GRID, fill=val_color)
+
+
+# ── Overview page layout constants ───────────────────────────────────────────
+_OV_LEFT_BAR_X0         = 20
+_OV_NODEID_X0           = 28    # start of node-id zone
+_OV_NODEID_ZONE         = 38    # width of zone (x=28..65)
+_OV_COL_STARTS          = (68, 146, 224)   # CPU, RAM, TMP column left edges (2px gaps)
+_OV_COL_W               = 76
+_OV_COL_LABELS          = ("CPU", "RAM", "TMP")
+_OV_COL_UNITS           = ("%", "%", "\u00b0C")
+_OV_LABEL_DRAW_Y_OFFSET = 1
+_OV_VALUE_DRAW_Y_OFFSET = 20
+_OV_UNIT_GAP            = 2
+_OV_BAR_Y0_OFFSET       = 74
+_OV_BAR_HEIGHT          = 5
+
+
+def draw_node_section_overview(
+    draw: ImageDraw.ImageDraw,
+    row_y: int,
+    node_id: str,
+    cpu_usage: Optional[float],
+    ram_usage: Optional[float],
+    cpu_temp: Optional[float],
+) -> None:
+    """Draw one node row for the overview page (no histogram).
+
+    Shows CPU%, RAM%, Temp as large 35pt numbers readable at ~1m on
+    a 1.69" ST7789 display. Does NOT push to histogram ring buffers.
+    """
+    accent   = NODE_COLORS.get(node_id, _DEFAULT_COLOR)
+    node_num = node_id.replace("node", "")
+
+    # Node ID zone: filled accent rectangle, black text centered in the rectangle
+    node_label = f"N{node_num}"
+    bb_nid  = FONT_OVERVIEW_NODEID.getbbox(node_label)
+    nid_w   = bb_nid[2] - bb_nid[0]
+    nid_h   = bb_nid[3] - bb_nid[1]
+    rect_w  = _OV_NODEID_X0 + _OV_NODEID_ZONE - _OV_LEFT_BAR_X0   # = 65 - 20 = 46px
+    nid_x   = _OV_LEFT_BAR_X0 + (rect_w - nid_w) // 2 - bb_nid[0]
+    nid_y   = row_y + (80 - nid_h) // 2 - bb_nid[1]
+    draw.rectangle([_OV_LEFT_BAR_X0, row_y, _OV_NODEID_X0 + _OV_NODEID_ZONE - 1, row_y + 79], fill=accent)
+    draw.text((nid_x, nid_y), node_label, font=FONT_OVERVIEW_NODEID, fill="#000000")
+
+    # Metric columns
+    raw_vals: tuple = (cpu_usage, ram_usage, cpu_temp)
+    for col_idx, (col_x, label, unit, raw_val) in enumerate(
+        zip(_OV_COL_STARTS, _OV_COL_LABELS, _OV_COL_UNITS, raw_vals)
+    ):
+        # Small label at top of column
+        bb_lab = FONT_OVERVIEW_LABEL.getbbox(label)
+        lab_w  = bb_lab[2] - bb_lab[0]
+        lab_x  = col_x + (_OV_COL_W - lab_w) // 2
+        draw.text(
+            (lab_x, row_y + _OV_LABEL_DRAW_Y_OFFSET),
+            label,
+            font=FONT_OVERVIEW_LABEL,
+            fill="#AAAAAA",
+        )
+
+        # Big value — right-aligned with reserved digit space
+        # Max strings: "100" for CPU/RAM (3 digits), "99" for TMP (2 digits)
+        max_str   = "99" if col_idx == 2 else "100"
+        bb_max    = FONT_OVERVIEW_VALUE.getbbox(max_str)
+        max_num_w = bb_max[2] - bb_max[0]
+        bb_unit   = FONT_OVERVIEW_UNIT.getbbox(unit)
+        unit_w    = bb_unit[2] - bb_unit[0]
+        # Right edge of the unit lands at col right edge; value sits left of unit
+        col_right = col_x + _OV_COL_W - 1
+        unit_x    = col_right - unit_w
+        val_right = unit_x - _OV_UNIT_GAP   # value right-aligns here
+
+        if raw_val is not None:
+            val_str   = str(int(raw_val))
+            val_color = _health_color_temp(raw_val) if col_idx == 2 else _health_color(raw_val)
+        else:
+            val_str   = "--"
+            val_color = "#444444"
+
+        bb_num = FONT_OVERVIEW_VALUE.getbbox(val_str)
+        num_w  = bb_num[2] - bb_num[0]
+        # Right-align within the reserved digit zone
+        val_x  = val_right - max_num_w + (max_num_w - num_w)
+
+        draw.text(
+            (val_x, row_y + _OV_VALUE_DRAW_Y_OFFSET),
+            val_str,
+            font=FONT_OVERVIEW_VALUE,
+            fill=val_color,
+        )
+
+        # Unit char flush right in column
+        if raw_val is not None:
+            draw.text(
+                (unit_x, row_y + _OV_VALUE_DRAW_Y_OFFSET),
+                unit,
+                font=FONT_OVERVIEW_UNIT,
+                fill="#888888",
+            )
+
+        # 6px progress bar at row bottom
+        bar_y0 = row_y + _OV_BAR_Y0_OFFSET
+        bar_y1 = bar_y0 + _OV_BAR_HEIGHT - 1
+        draw.rectangle([col_x, bar_y0, col_x + _OV_COL_W - 1, bar_y1], fill="#1A1A1A")
+        if raw_val is not None:
+            frac  = max(0.0, min(1.0, raw_val / (80.0 if col_idx == 2 else 100.0)))
+            bar_w = max(1, int(frac * _OV_COL_W))
+            draw.rectangle(
+                [col_x, bar_y0, col_x + bar_w - 1, bar_y1],
+                fill=val_color,
+            )
+
+
+# ── draw_node_section (used by _page_detail and directly) ────────────────────
+
+def draw_node_section(
+    draw: ImageDraw.ImageDraw,
+    x: int, y: int,
+    width: int, height: int,
+    node_id: str,
+    cpu_usage: Optional[float],
+    ram_usage: Optional[float],
+    cpu_temp: Optional[float],
+    sparkline_data=None,
+    font=None,
+) -> None:
+    """Draw one node row: header strip + CPU area chart + RAM bar."""
+
+    accent   = NODE_COLORS.get(node_id, _DEFAULT_COLOR)
+    node_num = node_id.replace("node", "")
+
+    _ensure_hist(node_id)
+    _push(_hist_cpu, node_id, cpu_usage)
+    _push(_hist_ram, node_id, ram_usage)
+
+    MARGIN    = 20
+    cx        = x + MARGIN
+    cw        = width - 2 * MARGIN
+
+    HEADER_H  = 15
+    RAM_BAR_H = 5
+    hist_y0   = y + HEADER_H
+    hist_y1   = y + height - RAM_BAR_H - 1
+    hist_h    = hist_y1 - hist_y0
+    ram_y0    = y + height - RAM_BAR_H
+    ram_y1    = y + height - 1
+    hist_w    = cw
+
+    # Header
+    hdr_y0 = y
+    hdr_y1 = y + HEADER_H - 1
+    draw.rectangle([cx, hdr_y0, cx + cw - 1, hdr_y1], fill=accent)
+
+    _hy = hdr_y0 + 2
+    draw.text((cx + 4, _hy - 1), f"N{node_num}", font=FONT_NODE_LABEL, fill="#000000")
+
+    temp_str = f"{cpu_temp:.0f}\u00b0C" if cpu_temp is not None else "--\u00b0C"
+    draw.text((cx + 28, _hy), temp_str, font=FONT_HEADER_STAT, fill="#000000")
+
+    cpu_str = f"CPU {cpu_usage:>3.0f}%" if cpu_usage is not None else "CPU  --%"
+    draw.text((cx + 80, _hy), cpu_str, font=FONT_HEADER_STAT, fill="#000000")
+
+    ram_str = f"RAM {ram_usage:>3.0f}%" if ram_usage is not None else "RAM  --%"
+    draw.text((cx + cw - 52, _hy), ram_str, font=FONT_HEADER_STAT, fill="#000000")
+
+    # Histogram
+    draw.rectangle([cx, hist_y0, cx + hist_w - 1, hist_y1], fill="#080808")
+
+    history = _hist_cpu[node_id]
+    cols    = min(len(history), hist_w)
+    slice_  = history[-cols:]
+
+    for i, val in enumerate(slice_):
+        col_x   = cx + (hist_w - cols) + i
+        bar_h   = max(1, int((val / 100.0) * hist_h))
+        bar_top = hist_y1 - bar_h
+
+        if val < 50:
+            fill_color, top_color = "#003319", "#00FF88"
+        elif val < 75:
+            fill_color, top_color = "#3D2E00", "#FFCC00"
+        else:
+            fill_color, top_color = "#3D0000", "#FF4444"
+
+        if bar_h > 1:
+            draw.line([(col_x, bar_top + 1), (col_x, hist_y1 - 1)], fill=fill_color)
+        draw.point((col_x, bar_top), fill=top_color)
+
+    draw.line([(cx, hist_y1), (cx + hist_w - 1, hist_y1)], fill=accent)
+
+    if cpu_usage is not None:
+        val_color = _health_color(cpu_usage)
+        big_label = f"{cpu_usage:.0f}%"
+        bb  = FONT_BIG_VALUE.getbbox(big_label)
+        tw  = bb[2] - bb[0]
+        tx  = cx + hist_w - tw - 4
+        ty  = hist_y1 - 1 - bb[3]
+        draw.rectangle([tx - 2, ty + bb[1] - 1, tx + tw + 1, hist_y1 - 2], fill="#000000CC")
+        draw.text((tx, ty), big_label, font=FONT_BIG_VALUE, fill=val_color)
+
+    # RAM bar
+    draw.rectangle([cx, ram_y0, cx + hist_w - 1, ram_y1], fill="#111111")
+    if ram_usage is not None:
+        ram_w = max(1, int((ram_usage / 100.0) * hist_w))
+        draw.rectangle([cx, ram_y0, cx + ram_w - 1, ram_y1], fill=_health_color(ram_usage))
+
+
+def push_node_metrics(node_id: str, cpu_usage: Optional[float], ram_usage: Optional[float]) -> None:
+    """Push CPU and RAM samples into the histogram ring buffers.
+
+    Call this from the display loop on every tick regardless of active page,
+    so the detail-page histogram stays populated even when overview is shown.
+    """
+    _ensure_hist(node_id)
+    _push(_hist_cpu, node_id, cpu_usage)
+    _push(_hist_ram, node_id, ram_usage)
+
+
+# ── Build the default PageManager ─────────────────────────────────────────────
+
+page_manager = PageManager()
+page_manager.register("overview", _page_overview)
+page_manager.register("detail",   _page_detail)
