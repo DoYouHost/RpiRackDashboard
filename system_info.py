@@ -1,6 +1,8 @@
 """System information gathering module with producer-consumer pattern and multi-node support"""
 
+import json
 import logging
+import subprocess
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from collections import deque
@@ -83,9 +85,16 @@ class SystemInfo:
 
     # ── Fans ───────────────────────────────────────────────────────────
     fans: Optional[Dict[str, float]] = None   # {fan_name: rpm}
-    
-    # ── Sytstem ───────────────────────────────────────────────────────────
+
+    # ── System ───────────────────────────────────────────────────────────
     uptime:       Optional[float] = None   # boot_time
+    throttle_state: Optional[str] = None   # JSON string with throttle flags
+
+    # ── Voltages (Raspberry Pi) ───────────────────────────────────────────
+    voltage_core: Optional[float] = None      # Core voltage (V)
+    voltage_sdram_c: Optional[float] = None   # SDRAM Controller voltage (V)
+    voltage_sdram_i: Optional[float] = None   # SDRAM I/O voltage (V)
+    voltage_sdram_p: Optional[float] = None   # SDRAM Physical voltage (V)
 
     timestamp: float = field(default_factory=time.time)
 
@@ -267,6 +276,12 @@ class ConsumerHandle:
             net_if_stats=last.net_if_stats,
             # Fans
             fans=last.fans,
+            # System (throttle and voltages)
+            throttle_state=last.throttle_state,
+            voltage_core=last.voltage_core,
+            voltage_sdram_c=last.voltage_sdram_c,
+            voltage_sdram_i=last.voltage_sdram_i,
+            voltage_sdram_p=last.voltage_sdram_p,
         )
 
 
@@ -366,6 +381,24 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
                 info.cpu_temp = int(f.read()) / 1000.0
     except:
         pass
+
+    # Throttle State (Raspberry Pi)
+    try:
+        result = subprocess.run(["vcgencmd", "get_throttled"],
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            # Parse output: "throttled=0x80000"
+            hex_str = result.stdout.strip().split("=")[1]
+            hex_value = int(hex_str, 16)
+            info.throttle_state = _parse_throttle_state(hex_value)
+    except Exception:
+        pass
+
+    # Voltage Measurements (Raspberry Pi)
+    info.voltage_core = _get_voltage("core")
+    info.voltage_sdram_c = _get_voltage("sdram_c")
+    info.voltage_sdram_i = _get_voltage("sdram_i")
+    info.voltage_sdram_p = _get_voltage("sdram_p")
 
     # CPU Usage
     try:
@@ -560,6 +593,57 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
         pass
 
     return info
+
+
+def _parse_throttle_state(hex_value: int) -> str:
+    """Convert vcgencmd throttle hex value to human-readable flags.
+
+    Args:
+        hex_value: Integer from vcgencmd get_throttled hex output
+
+    Returns:
+        JSON string with boolean throttle flags.
+        Bit meanings:
+        - 0/16: Under-voltage (detected/occurred)
+        - 1/17: Arm frequency capped (current/historical)
+        - 2/18: Throttled (current/historical)
+        - 3/19: Soft temp limit (current/historical)
+    """
+    flags = {
+        "under_voltage_now": bool(hex_value & (1 << 0)),
+        "freq_capped_now": bool(hex_value & (1 << 1)),
+        "throttled_now": bool(hex_value & (1 << 2)),
+        "temp_limit_now": bool(hex_value & (1 << 3)),
+        "under_voltage_history": bool(hex_value & (1 << 16)),
+        "freq_capped_history": bool(hex_value & (1 << 17)),
+        "throttled_history": bool(hex_value & (1 << 18)),
+        "temp_limit_history": bool(hex_value & (1 << 19)),
+    }
+    return json.dumps(flags)
+
+
+def _get_voltage(domain: str) -> Optional[float]:
+    """Get voltage measurement from vcgencmd for a specific domain.
+
+    Args:
+        domain: Voltage domain (core, sdram_c, sdram_i, sdram_p)
+
+    Returns:
+        Voltage value as float in volts, or None if unavailable.
+        Example output: "measure_volts=1.2345V" -> 1.2345
+    """
+    try:
+        result = subprocess.run(["vcgencmd", "measure_volts", domain],
+                              capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            # Parse output: "measure_volts=1.2345V"
+            output = result.stdout.strip()
+            if "=" in output:
+                volt_str = output.split("=")[1].rstrip("V")
+                return float(volt_str)
+    except Exception:
+        pass
+    return None
 
 
 class SystemInfoProducer:

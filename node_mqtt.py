@@ -14,17 +14,22 @@ logger = logging.getLogger(__name__)
 
 # Maps structured topic suffix → flat display key used by display_loop / get_node_info
 _DISPLAY_KEY_MAP = {
-    "cpu/usage":     "cpu_usage",
-    "cpu/temp":      "cpu_temp",
-    "cpu/freq":      "cpu_freq",
-    "cpu/load_1":    "load_avg_1",
-    "cpu/load_5":    "load_avg_5",
-    "cpu/load_15":   "load_avg_15",
-    "ram/percent":   "ram_usage",
-    "disk/usage":    "disk_usage",
-    "net/tx_rate":   "net_tx_rate",
-    "net/rx_rate":   "net_rx_rate",
-    "system/uptime": "uptime",
+    "cpu/usage":             "cpu_usage",
+    "cpu/temp":              "cpu_temp",
+    "cpu/freq":              "cpu_freq",
+    "cpu/load_1":            "load_avg_1",
+    "cpu/load_5":            "load_avg_5",
+    "cpu/load_15":           "load_avg_15",
+    "ram/percent":           "ram_usage",
+    "disk/usage":            "disk_usage",
+    "net/tx_rate":           "net_tx_rate",
+    "net/rx_rate":           "net_rx_rate",
+    "system/uptime":         "uptime",
+    "system/throttled":      "throttle_state",
+    "system/voltage/core":   "voltage_core",
+    "system/voltage/sdram_c": "voltage_sdram_c",
+    "system/voltage/sdram_i": "voltage_sdram_i",
+    "system/voltage/sdram_p": "voltage_sdram_p",
 }
 
 
@@ -225,6 +230,13 @@ def publish_node_metrics(mqtt_client: Client, prefix: str, sys_info: SystemInfo)
 
     # System
     if sys_info.uptime is not None: pub("system/uptime", sys_info.uptime)
+    if sys_info.throttle_state is not None: pub("system/throttled", sys_info.throttle_state)
+
+    # Voltages
+    if sys_info.voltage_core is not None: pub("system/voltage/core", sys_info.voltage_core)
+    if sys_info.voltage_sdram_c is not None: pub("system/voltage/sdram_c", sys_info.voltage_sdram_c)
+    if sys_info.voltage_sdram_i is not None: pub("system/voltage/sdram_i", sys_info.voltage_sdram_i)
+    if sys_info.voltage_sdram_p is not None: pub("system/voltage/sdram_p", sys_info.voltage_sdram_p)
 
     # Fans
     if sys_info.fans:
