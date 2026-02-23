@@ -4,11 +4,9 @@ import json
 import logging
 import subprocess
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
-from collections import deque
+from typing import Optional, Dict, Any
 import threading
 import queue
-import socket
 import psutil
 import time
 
@@ -285,78 +283,6 @@ class ConsumerHandle:
         )
 
 
-class NodeMetricsHistory:
-    """Tracks 1-hour rolling window of metrics per node for sparkline rendering"""
-
-    def __init__(self, max_samples: int = 3600):
-        """
-        Initialize history tracker.
-
-        Args:
-            max_samples: Maximum samples to keep (1 per second = 3600 for 1 hour)
-        """
-        self.max_samples = max_samples
-        self.history: Dict[str, Dict[str, deque]] = {}
-        self._lock = threading.Lock()
-
-    def update(self, sys_info: "SystemInfo") -> None:
-        """Record a new measurement for a node.
-
-        Args:
-            sys_info: SystemInfo with node_id and metrics
-        """
-        node_id = sys_info.node_id
-        with self._lock:
-            if node_id not in self.history:
-                self.history[node_id] = {
-                    "cpu_usage": deque(maxlen=self.max_samples),
-                    "ram_usage": deque(maxlen=self.max_samples),
-                    "cpu_temp": deque(maxlen=self.max_samples),
-                }
-
-            # Add values, skip None
-            if sys_info.cpu_usage is not None:
-                self.history[node_id]["cpu_usage"].append(sys_info.cpu_usage)
-            if sys_info.ram_usage is not None:
-                self.history[node_id]["ram_usage"].append(sys_info.ram_usage)
-            if sys_info.cpu_temp is not None:
-                self.history[node_id]["cpu_temp"].append(sys_info.cpu_temp)
-
-    def get_sparkline(self, node_id: str, metric: str, width: int = 30) -> List[int]:
-        """Get sparkline data for a metric, downsampled to fit display width.
-
-        Args:
-            node_id: Node identifier
-            metric: "cpu_usage", "ram_usage", or "cpu_temp"
-            width: Target width in pixels/characters for sparkline
-
-        Returns:
-            List of values scaled to 0-100 for sparkline rendering
-        """
-        with self._lock:
-            if node_id not in self.history or metric not in self.history[node_id]:
-                return []
-
-            data = list(self.history[node_id][metric])
-            if not data:
-                return []
-
-            # Downsample if needed
-            if len(data) > width:
-                step = len(data) // width
-                downsampled = [data[i * step] for i in range(width)]
-            else:
-                downsampled = data
-
-            # Normalize to 0-100
-            min_val = min(downsampled) if downsampled else 0
-            max_val = max(downsampled) if downsampled else 1
-            range_val = max_val - min_val if max_val > min_val else 1
-
-            normalized = [int(100 * (v - min_val) / range_val) for v in downsampled]
-            return normalized
-
-
 # ── Network rate state ────────────────────────────────────────────────────────
 # Persists between calls to compute bytes/sec deltas.
 _prev_net_counters: Optional[Any] = None
@@ -379,7 +305,7 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
         else:
             with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
                 info.cpu_temp = int(f.read()) / 1000.0
-    except:
+    except Exception:
         pass
 
     # Throttle State (Raspberry Pi)
@@ -403,33 +329,28 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
     # CPU Usage
     try:
         info.cpu_usage = psutil.cpu_percent(interval=0.1)
-    except:
+    except Exception:
         pass
 
     # RAM Usage
     try:
         info.ram_usage = psutil.virtual_memory().percent
-    except:
+    except Exception:
         pass
 
-    # CPU Frequency (current)
-    try:
-        info.cpu_freq = psutil.cpu_freq().current
-    except:
-        pass
-
-    # CPU Frequency min/max + count + stats
+    # CPU Frequency (current, min, max)
     try:
         f = psutil.cpu_freq()
         if f:
+            info.cpu_freq = f.current
             info.cpu_freq_min = f.min
             info.cpu_freq_max = f.max
-    except:
+    except Exception:
         pass
     try:
         info.cpu_count = psutil.cpu_count(logical=True)
         info.cpu_count_physical = psutil.cpu_count(logical=False)
-    except:
+    except Exception:
         pass
     try:
         s = psutil.cpu_stats()
@@ -437,19 +358,19 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
         info.cpu_interrupts      = s.interrupts
         info.cpu_soft_interrupts = s.soft_interrupts
         info.cpu_syscalls        = s.syscalls
-    except:
+    except Exception:
         pass
 
-    # Uptime (in seconds)
+    # Boot time (Unix timestamp — uptime = time.time() - boot_time)
     try:
         info.uptime = psutil.boot_time()
-    except:
+    except Exception:
         pass
 
     # Disk usage (root filesystem)
     try:
         info.disk_usage = psutil.disk_usage('/').percent
-    except:
+    except Exception:
         pass
 
     # Disk IO counters
@@ -462,7 +383,7 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
             info.disk_io_write_count = dio.write_count
             info.disk_io_read_time   = dio.read_time
             info.disk_io_write_time  = dio.write_time
-    except:
+    except Exception:
         pass
 
     # Disk partitions (physical only)
@@ -478,11 +399,11 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
                     used=u.used,
                     free=u.free,
                 )
-            except:
+            except Exception:
                 pass
         if parts:
             info.disk_partitions = parts
-    except:
+    except Exception:
         pass
 
     # RAM extras
@@ -495,7 +416,7 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
         for attr in ("active", "inactive", "buffers", "cached", "shared", "slab"):
             if hasattr(vm, attr):
                 setattr(info, f"ram_{attr}", getattr(vm, attr))
-    except:
+    except Exception:
         pass
 
     # Swap
@@ -507,36 +428,31 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
         info.swap_free    = sw.free
         info.swap_sin     = sw.sin
         info.swap_sout    = sw.sout
-    except:
+    except Exception:
         pass
 
-    # Network TX/RX rates (bytes/sec) — computed as delta from previous sample
+    # Network TX/RX rates (delta) + cumulative counters — single syscall
     global _prev_net_counters, _prev_net_time
     try:
         now = time.monotonic()
         counters = psutil.net_io_counters()
-        if _prev_net_counters is not None and _prev_net_time is not None:
-            dt = now - _prev_net_time
-            if dt > 0:
-                info.net_tx_rate = (counters.bytes_sent - _prev_net_counters.bytes_sent) / dt
-                info.net_rx_rate = (counters.bytes_recv - _prev_net_counters.bytes_recv) / dt
-        _prev_net_counters = counters
-        _prev_net_time = now
-    except:
-        pass
-
-    # Net IO counters (cumulative)
-    try:
-        io = psutil.net_io_counters()
-        info.net_bytes_sent   = io.bytes_sent
-        info.net_bytes_recv   = io.bytes_recv
-        info.net_packets_sent = io.packets_sent
-        info.net_packets_recv = io.packets_recv
-        info.net_errin        = io.errin
-        info.net_errout       = io.errout
-        info.net_dropin       = io.dropin
-        info.net_dropout      = io.dropout
-    except:
+        if counters is not None:
+            if _prev_net_counters is not None and _prev_net_time is not None:
+                dt = now - _prev_net_time
+                if dt > 0:
+                    info.net_tx_rate = (counters.bytes_sent - _prev_net_counters.bytes_sent) / dt
+                    info.net_rx_rate = (counters.bytes_recv - _prev_net_counters.bytes_recv) / dt
+            _prev_net_counters = counters
+            _prev_net_time = now
+            info.net_bytes_sent   = counters.bytes_sent
+            info.net_bytes_recv   = counters.bytes_recv
+            info.net_packets_sent = counters.packets_sent
+            info.net_packets_recv = counters.packets_recv
+            info.net_errin        = counters.errin
+            info.net_errout       = counters.errout
+            info.net_dropin       = counters.dropin
+            info.net_dropout      = counters.dropout
+    except Exception:
         pass
 
     # Net connections
@@ -545,7 +461,7 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
         info.net_connections             = len(conns)
         info.net_connections_established = sum(1 for c in conns if c.status == 'ESTABLISHED')
         info.net_connections_listen      = sum(1 for c in conns if c.status == 'LISTEN')
-    except:
+    except Exception:
         pass
 
     # Per-interface stats + per-nic IO
@@ -566,7 +482,7 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
                 )
         if ifaces:
             info.net_if_stats = ifaces
-    except:
+    except Exception:
         pass
 
     # Load averages (1, 5, 15 min)
@@ -575,7 +491,7 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
         info.load_avg_1  = load1
         info.load_avg_5  = load5
         info.load_avg_15 = load15
-    except:
+    except Exception:
         pass
 
     # Fans
@@ -589,7 +505,7 @@ def get_system_info(node_id: str = "local") -> "SystemInfo":
                     fans[key] = fan.current
             if fans:
                 info.fans = fans
-    except:
+    except Exception:
         pass
 
     return info
@@ -715,4 +631,4 @@ class SystemInfoProducer:
             for _ in range(int(self.update_interval * 10)):
                 if not self.running:
                     break
-                threading.Event().wait(0.1)
+                time.sleep(0.1)

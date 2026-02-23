@@ -15,7 +15,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class HAEntities:
     sensor: Optional[Sensor] = None
-    render_time_sensor: Optional[Sensor] = None
+    page_render_time_sensor: Optional[Sensor] = None
+    dma_time_sensor: Optional[Sensor] = None
+    total_render_time_sensor: Optional[Sensor] = None
     throttle_alerts: Optional[Sensor] = None
     light: Optional[Light] = None
     btn_next: Optional[Button] = None
@@ -30,8 +32,7 @@ def setup_ha_entities(
     transition_backlight_fn: Callable[[float, float], None],
     page_next_fn: Callable[[], None],
     page_prev_fn: Callable[[], None],
-    get_previous_brightness_fn: Callable[[], float] = None,
-    set_previous_brightness_fn: Callable[[float], None] = None,
+    get_previous_brightness_fn: Optional[Callable[[], float]] = None,
 ) -> HAEntities:
     """Initialize all Home Assistant MQTT entities.
 
@@ -120,15 +121,35 @@ def setup_ha_entities(
         )
         entities.sensor = Sensor(Settings(mqtt=mqtt_settings, entity=sensor_info))
 
-        # Screen render time sensor
-        render_time_info = SensorInfo(
-            name="Screen render time",
+        # Screen page render time sensor (PIL drawing)
+        page_render_time_info = SensorInfo(
+            name="Screen page render time",
             unit_of_measurement="ms",
-            unique_id="screen_render_time_001",
+            unique_id="screen_page_render_time_001",
             device=device_info,
             expire_after=60,
         )
-        entities.render_time_sensor = Sensor(Settings(mqtt=mqtt_settings, entity=render_time_info))
+        entities.page_render_time_sensor = Sensor(Settings(mqtt=mqtt_settings, entity=page_render_time_info))
+
+        # Screen DMA time sensor (display transfer)
+        dma_time_info = SensorInfo(
+            name="Screen DMA time",
+            unit_of_measurement="ms",
+            unique_id="screen_dma_time_001",
+            device=device_info,
+            expire_after=60,
+        )
+        entities.dma_time_sensor = Sensor(Settings(mqtt=mqtt_settings, entity=dma_time_info))
+
+        # Total screen render time sensor (page render + DMA)
+        total_render_time_info = SensorInfo(
+            name="Screen total render time",
+            unit_of_measurement="ms",
+            unique_id="screen_total_render_time_001",
+            device=device_info,
+            expire_after=60,
+        )
+        entities.total_render_time_sensor = Sensor(Settings(mqtt=mqtt_settings, entity=total_render_time_info))
 
         # Throttle Alerts sensor
         alerts_info = SensorInfo(

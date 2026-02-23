@@ -16,7 +16,7 @@ from system_info import SystemInfoProducer
 from display_utils import page_manager, push_node_metrics, make_node_detail_page
 from display_device import (
     init_device, set_backlight, transition_backlight, cleanup_device,
-    get_previous_brightness, set_previous_brightness
+    get_previous_brightness, get_current_brightness
 )
 from node_mqtt import MultiNodeCollector, publish_node_metrics
 from ha_mqtt import setup_ha_entities, get_throttle_alerts
@@ -83,11 +83,11 @@ ha = setup_ha_entities(
     page_next_fn=page_manager.next,
     page_prev_fn=page_manager.prev,
     get_previous_brightness_fn=get_previous_brightness,
-    set_previous_brightness_fn=set_previous_brightness,
 )
 
-# Shared render-time measurement
-_last_render_ms: Optional[float] = None
+# Shared render-time measurements (page render + DMA transfer)
+_last_page_render_ms: Optional[float] = None
+_last_dma_ms: Optional[float] = None
 _render_ms_lock = threading.Lock()
 
 # ============================================================================
@@ -217,16 +217,22 @@ def display_loop() -> None:
                 nd = page_data.get(node_id, {})
                 push_node_metrics(node_id, nd.get("cpu_usage"), nd.get("ram_usage"))
 
-            frame_image = Image.new("RGB", (device.width, device.height), (0, 0, 0))
-            frame_draw  = ImageDraw.Draw(frame_image)
-            _t0 = time.monotonic()
-            page_manager.render(frame_draw, device.width, device.height, page_data)
-            device.display(frame_image)
-            _render_ms = (time.monotonic() - _t0) * 1000
+            if get_current_brightness() >= 0.01:
+                frame_image = Image.new("RGB", (device.width, device.height), (0, 0, 0))
+                frame_draw  = ImageDraw.Draw(frame_image)
 
-            with _render_ms_lock:
-                global _last_render_ms
-                _last_render_ms = _render_ms
+                _t0 = time.monotonic()
+                page_manager.render(frame_draw, device.width, device.height, page_data)
+                _page_render_ms = (time.monotonic() - _t0) * 1000
+
+                _t1 = time.monotonic()
+                device.display(frame_image)
+                _dma_ms = (time.monotonic() - _t1) * 1000
+
+                with _render_ms_lock:
+                    global _last_page_render_ms, _last_dma_ms
+                    _last_page_render_ms = _page_render_ms
+                    _last_dma_ms = _dma_ms
 
             # Auto-return to overview after 30 seconds without user navigation
             elapsed_since_nav = time.monotonic() - page_manager.last_nav_time
@@ -253,8 +259,10 @@ def sensor_loop() -> None:
 
         if mqtt_host:
             mqtt_client = Client()
-            if os.getenv("MQTT_USERNAME") and os.getenv("MQTT_PASSWORD"):
-                mqtt_client.username_pw_set(os.getenv("MQTT_USERNAME"), os.getenv("MQTT_PASSWORD"))
+            mqtt_username = os.getenv("MQTT_USERNAME")
+            mqtt_password = os.getenv("MQTT_PASSWORD")
+            if mqtt_username and mqtt_password:
+                mqtt_client.username_pw_set(mqtt_username, mqtt_password)
             try:
                 mqtt_client.connect(mqtt_host, 1883, keepalive=60)
                 mqtt_client.loop_start()
@@ -265,26 +273,33 @@ def sensor_loop() -> None:
 
         while True:
             now = time.time()
+            sys_info = sensor_consumer.get_all()
 
             # Update Home Assistant every ~10 seconds
             if now - last_ha_update >= 10.0:
-                sys_info = sensor_consumer.get_all()
-
                 if ha.sensor is not None and sys_info.cpu_temp is not None:
                     ha.sensor.set_state(sys_info.cpu_temp)
                     logger.debug("Updated sensor value: %.2f°C", sys_info.cpu_temp)
 
                 with _render_ms_lock:
-                    render_ms = _last_render_ms
-                if ha.render_time_sensor is not None and render_ms is not None:
-                    ha.render_time_sensor.set_state(round(render_ms, 1))
-                    logger.debug("Screen render time: %.1fms", render_ms)
+                    page_render_ms = _last_page_render_ms
+                    dma_ms = _last_dma_ms
+
+                if page_render_ms is not None and dma_ms is not None:
+                    total_ms = page_render_ms + dma_ms
+                    if ha.page_render_time_sensor is not None:
+                        ha.page_render_time_sensor.set_state(round(page_render_ms, 1))
+                    if ha.dma_time_sensor is not None:
+                        ha.dma_time_sensor.set_state(round(dma_ms, 1))
+                    if ha.total_render_time_sensor is not None:
+                        ha.total_render_time_sensor.set_state(round(total_ms, 1))
+                    logger.debug("Screen render: page=%.1fms dma=%.1fms total=%.1fms",
+                                 page_render_ms, dma_ms, total_ms)
 
                 last_ha_update = now
 
             # Publish node1 metrics to MQTT every 5 seconds
             if mqtt_client and now - last_mqtt_publish >= 5.0:
-                sys_info = sensor_consumer.get_all()
                 publish_node_metrics(mqtt_client, "rack/node1", sys_info)
                 logger.debug("Published node1 metrics to MQTT")
 

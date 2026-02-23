@@ -231,7 +231,8 @@ class PageManager:
 
     @property
     def page_count(self) -> int:
-        return len(self._pages)
+        with self._lock:
+            return len(self._pages)
 
     # ── Rendering ────────────────────────────────────────────────────────────
 
@@ -566,15 +567,7 @@ def _page_detail(draw: ImageDraw.ImageDraw, width: int, height: int,
     SSTAT_R2_VAL_Y = 201   # row 2 value reference Y (before -bb[1] correction)
 
     # ── Value strings ──────────────────────────────────────────────────────────
-    uptime_str = "--"
-    if uptime is not None:
-        uptime_seconds = int(time.time() - uptime)
-        if uptime_seconds < 3600:
-            uptime_str = f"{uptime_seconds // 60}m"
-        elif uptime_seconds < 86400:
-            uptime_str = f"{uptime_seconds // 3600}h"
-        else:
-            uptime_str = f"{uptime_seconds // 86400}d"
+    uptime_str = _format_elapsed(int(time.time() - uptime)) if uptime is not None else "--"
 
     if disk_usage is not None:
         disk_str   = f"{disk_usage:.0f}%"
@@ -898,80 +891,6 @@ def _draw_histogram_np(
         arr[bar_top, col] = top_colors[i]
 
     draw._image.paste(Image.fromarray(arr, "RGB"), (cx, hist_y0))  # type: ignore[attr-defined]
-
-
-# ── draw_node_section (used by _page_detail and directly) ────────────────────
-
-def draw_node_section(
-    draw: ImageDraw.ImageDraw,
-    x: int, y: int,
-    width: int, height: int,
-    node_id: str,
-    cpu_usage: Optional[float],
-    ram_usage: Optional[float],
-    cpu_temp: Optional[float],
-    sparkline_data=None,
-    font=None,
-) -> None:
-    """Draw one node row: header strip + CPU area chart + RAM bar."""
-
-    accent   = NODE_COLORS.get(node_id, _DEFAULT_COLOR)
-    node_num = node_id.replace("node", "")
-
-    _ensure_hist(node_id)
-    _push(_hist_cpu, node_id, cpu_usage)
-    _push(_hist_ram, node_id, ram_usage)
-
-    MARGIN    = 20
-    cx        = x + MARGIN
-    cw        = width - 2 * MARGIN
-
-    HEADER_H  = 15
-    RAM_BAR_H = 5
-    hist_y0   = y + HEADER_H
-    hist_y1   = y + height - RAM_BAR_H - 1
-    hist_h    = hist_y1 - hist_y0
-    ram_y0    = y + height - RAM_BAR_H
-    ram_y1    = y + height - 1
-    hist_w    = cw
-
-    # Header
-    hdr_y0 = y
-    hdr_y1 = y + HEADER_H - 1
-    draw.rectangle([cx, hdr_y0, cx + cw - 1, hdr_y1], fill=accent)
-
-    _hy = hdr_y0 + 2
-    draw.text((cx + 4, _hy - 1), f"N{node_num}", font=FONT_NODE_LABEL, fill="#000000")
-
-    temp_str = f"{cpu_temp:.0f}\u00b0C" if cpu_temp is not None else "--\u00b0C"
-    draw.text((cx + 28, _hy), temp_str, font=FONT_HEADER_STAT, fill="#000000")
-
-    cpu_str = f"CPU {cpu_usage:>3.0f}%" if cpu_usage is not None else "CPU  --%"
-    draw.text((cx + 80, _hy), cpu_str, font=FONT_HEADER_STAT, fill="#000000")
-
-    ram_str = f"RAM {ram_usage:>3.0f}%" if ram_usage is not None else "RAM  --%"
-    draw.text((cx + cw - 52, _hy), ram_str, font=FONT_HEADER_STAT, fill="#000000")
-
-    # Histogram — rendered via NumPy into a sub-image then pasted
-    _draw_histogram_np(draw, cx, hist_y0, hist_y1, hist_w, _hist_cpu[node_id])
-
-    draw.line([(cx, hist_y1), (cx + hist_w - 1, hist_y1)], fill=accent)
-
-    if cpu_usage is not None:
-        val_color = _health_color(cpu_usage)
-        big_label = f"{cpu_usage:.0f}%"
-        bb  = _bb(FONT_BIG_VALUE, big_label)
-        tw  = bb[2] - bb[0]
-        tx  = cx + hist_w - tw - 4
-        ty  = hist_y1 - 1 - bb[3]
-        draw.rectangle([tx - 2, ty + bb[1] - 1, tx + tw + 1, hist_y1 - 2], fill="#000000CC")
-        draw.text((tx, ty), big_label, font=FONT_BIG_VALUE, fill=val_color)
-
-    # RAM bar
-    draw.rectangle([cx, ram_y0, cx + hist_w - 1, ram_y1], fill="#111111")
-    if ram_usage is not None:
-        ram_w = max(1, int((ram_usage / 100.0) * hist_w))
-        draw.rectangle([cx, ram_y0, cx + ram_w - 1, ram_y1], fill=_health_color(ram_usage))
 
 
 def push_node_metrics(node_id: str, cpu_usage: Optional[float], ram_usage: Optional[float]) -> None:

@@ -178,8 +178,11 @@ def set_backlight(value: float) -> None:
     """Set backlight brightness instantly. value is 0.0–1.0."""
     global _current_brightness, _previous_brightness
     value = max(0.0, min(1.0, value))
-    # Save current brightness before turning off, so it can be restored on next ON
-    if _current_brightness > 0.01 and value < 0.01:
+    # Save current brightness before turning off so it can be restored on next ON.
+    # Skip when called from the transition thread — at that point _current_brightness
+    # has already faded to a tiny intermediate value, not the original bright level.
+    if (value < 0.01 and _current_brightness > 0.01
+            and threading.current_thread() is not _transition_thread):
         _previous_brightness = _current_brightness
     _current_brightness = value
     if _simulator_mode:
@@ -193,8 +196,11 @@ def transition_backlight(target: float, duration_sec: float) -> None:
 
     Runs in a background thread; cancels any in-progress transition.
     """
-    global _transition_thread
+    global _transition_thread, _previous_brightness
     target = max(0.0, min(1.0, target))
+    
+    if _current_brightness > 0.01 and target < 0.01:
+        _previous_brightness = _current_brightness
 
     def _run(target: float, duration: float) -> None:
         steps = max(1, int(duration * 50))
@@ -212,6 +218,11 @@ def transition_backlight(target: float, duration_sec: float) -> None:
             target=_run, args=(target, duration_sec), daemon=True
         )
         _transition_thread.start()
+
+
+def get_current_brightness() -> float:
+    """Return the current backlight brightness (0.0–1.0)."""
+    return _current_brightness
 
 
 def get_previous_brightness() -> float:

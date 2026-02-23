@@ -3,7 +3,7 @@
 import logging
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from paho.mqtt.client import Client, MQTTMessage
 
@@ -49,7 +49,6 @@ class MultiNodeCollector:
         self.latest_metrics: Dict[str, dict] = {node: {} for node in nodes}
         self._last_seen: Dict[str, float] = {}
         self._lock = threading.Lock()
-        self.running = False
 
     def setup(self, host: str, username: Optional[str] = None, password: Optional[str] = None) -> None:
         """Connect to MQTT broker and subscribe to node topics.
@@ -70,7 +69,6 @@ class MultiNodeCollector:
             self.client.subscribe(topic)
             logger.info("Subscribed to %s", topic)
 
-        self.running = True
         self.client.loop_start()
 
     def _on_message(self, client, userdata, message: MQTTMessage) -> None:
@@ -84,9 +82,13 @@ class MultiNodeCollector:
             suffix  = parts[2]
 
             try:
-                value = float(message.payload.decode())
-            except (ValueError, UnicodeDecodeError):
+                payload_str = message.payload.decode()
+            except UnicodeDecodeError:
                 return
+            try:
+                value: Any = float(payload_str)
+            except ValueError:
+                value = payload_str  # keep as string (e.g. throttle_state JSON)
 
             with self._lock:
                 if node_id not in self.latest_metrics:
@@ -134,19 +136,11 @@ class MultiNodeCollector:
                 load_avg_1=metrics.get("load_avg_1"),
                 load_avg_5=metrics.get("load_avg_5"),
                 load_avg_15=metrics.get("load_avg_15"),
+                throttle_state=metrics.get("throttle_state"),
             )
-
-    def get_all_nodes(self) -> dict:
-        """Get latest metrics for all nodes.
-
-        Returns:
-            Dict of {node_id: SystemInfo}
-        """
-        return {node_id: self.get_node_info(node_id) for node_id in self.nodes}
 
     def stop(self) -> None:
         """Stop collecting metrics."""
-        self.running = False
         self.client.loop_stop()
 
 
