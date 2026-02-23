@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 class HAEntities:
     sensor: Optional[Sensor] = None
     render_time_sensor: Optional[Sensor] = None
+    throttle_alerts: Optional[Sensor] = None
     light: Optional[Light] = None
     btn_next: Optional[Button] = None
     btn_prev: Optional[Button] = None
@@ -129,6 +130,15 @@ def setup_ha_entities(
         )
         entities.render_time_sensor = Sensor(Settings(mqtt=mqtt_settings, entity=render_time_info))
 
+        # Throttle Alerts sensor
+        alerts_info = SensorInfo(
+            name="Throttle Alerts",
+            unique_id="throttle_alerts_001",
+            device=device_info,
+            expire_after=60,
+        )
+        entities.throttle_alerts = Sensor(Settings(mqtt=mqtt_settings, entity=alerts_info))
+
         # Page navigation buttons
         btn_next_info = ButtonInfo(name="Page Next", unique_id="page_next_001", device=device_info)
         entities.btn_next = Button(Settings(mqtt=mqtt_settings, entity=btn_next_info), _btn_next_callback)
@@ -147,3 +157,45 @@ def setup_ha_entities(
         logger.warning("Dashboard will run without MQTT Home Assistant integration")
 
     return entities
+
+
+def get_throttle_alerts(throttle_state_json: Optional[str]) -> list:
+    """Parse throttle state JSON and return list of active alert types.
+
+    Args:
+        throttle_state_json: JSON string from system_info.throttle_state
+
+    Returns:
+        List of alert type strings
+    """
+    if not throttle_state_json:
+        return []
+
+    try:
+        flags = json.loads(throttle_state_json)
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+    alerts = []
+
+    # Current state alerts
+    if flags.get("under_voltage_now"):
+        alerts.append("under_voltage_now")
+    if flags.get("freq_capped_now"):
+        alerts.append("freq_capped_now")
+    if flags.get("throttled_now"):
+        alerts.append("throttled_now")
+    if flags.get("temp_limit_now"):
+        alerts.append("temp_limit_now")
+
+    # Historical alerts
+    if flags.get("under_voltage_history"):
+        alerts.append("under_voltage_history")
+    if flags.get("freq_capped_history"):
+        alerts.append("freq_capped_history")
+    if flags.get("throttled_history"):
+        alerts.append("throttled_history")
+    if flags.get("temp_limit_history"):
+        alerts.append("temp_limit_history")
+
+    return alerts

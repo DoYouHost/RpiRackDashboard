@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import random
@@ -18,7 +19,7 @@ from display_device import (
     get_previous_brightness, set_previous_brightness
 )
 from node_mqtt import MultiNodeCollector, publish_node_metrics
-from ha_mqtt import setup_ha_entities
+from ha_mqtt import setup_ha_entities, get_throttle_alerts
 
 # Load environment variables from .env file
 load_dotenv()
@@ -286,6 +287,22 @@ def sensor_loop() -> None:
                 sys_info = sensor_consumer.get_all()
                 publish_node_metrics(mqtt_client, "rack/node1", sys_info)
                 logger.debug("Published node1 metrics to MQTT")
+
+                # Publish throttle alerts from all nodes
+                if ha.throttle_alerts is not None:
+                    alerts_by_node = {}
+                    for node_id in NODES:
+                        node_info = node_collector.get_node_info(node_id)
+                        if node_info and node_info.throttle_state:
+                            alerts = get_throttle_alerts(node_info.throttle_state)
+                            if alerts:
+                                alerts_by_node[node_id] = alerts
+
+                    payload = json.dumps(alerts_by_node) if alerts_by_node else "{}"
+                    ha.throttle_alerts.set_state(payload)
+                    if alerts_by_node:
+                        logger.info("Published throttle alerts: %s", payload)
+
                 last_mqtt_publish = now
 
             time.sleep(5)
